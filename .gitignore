@@ -1,0 +1,9 @@
+# ReCode local database
+.recode
+
+# Build output / editor tooling caches
+build/
+build*/
+.cache/
+compile_commands.json
+
