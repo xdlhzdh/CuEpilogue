@@ -8,6 +8,8 @@
 #include <random>
 #include <vector>
 
+#include <cuda_fp16.h>
+
 namespace cu_epilogue {
 
 // Fills `data` with pseudo-random values in [-scale, scale], seeded
@@ -36,6 +38,25 @@ inline void ReferenceGemmRowMajor(int M, int N, int K, float alpha,
       C[m * N + n] = static_cast<float>(alpha * acc + beta * prev);
     }
   }
+}
+
+// Round a float to IEEE binary16 and back, matching the device-side
+// `static_cast<cutlass::half_t>(float)` conversion used before GEMM.
+inline float RoundToFp16(float value) {
+  return __half2float(__float2half(value));
+}
+
+// Row-major GEMM reference with operands pre-quantized to FP16, so the
+// CPU ground truth matches what the Tensor Core kernel actually computes.
+inline void ReferenceGemmFp16InputsRowMajor(int M, int N, int K, float alpha,
+                                              const std::vector<float> &A,
+                                              const std::vector<float> &B,
+                                              float beta,
+                                              std::vector<float> &C) {
+  std::vector<float> a_fp16(A.size()), b_fp16(B.size());
+  for (size_t i = 0; i < A.size(); ++i) a_fp16[i] = RoundToFp16(A[i]);
+  for (size_t i = 0; i < B.size(); ++i) b_fp16[i] = RoundToFp16(B[i]);
+  ReferenceGemmRowMajor(M, N, K, alpha, a_fp16, b_fp16, beta, C);
 }
 
 // Returns {max_abs_error, max_relative_error} between two equally-sized

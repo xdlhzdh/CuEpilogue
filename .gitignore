@@ -7,3 +7,6 @@ build*/
 .cache/
 compile_commands.json
 
+# nsys/ncu profiling artifacts (machine-specific binary reports)
+profile_reports/
+

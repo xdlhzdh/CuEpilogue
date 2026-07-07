@@ -26,7 +26,7 @@ bool RunCase(int M, int N, int K) {
   FillRandom(hB, 1.0f, /*seed=*/12);
 
   const float alpha = 1.0f, beta = 0.0f;
-  ReferenceGemmRowMajor(M, N, K, alpha, hA, hB, beta, hRef);
+  ReferenceGemmFp16InputsRowMajor(M, N, K, alpha, hA, hB, beta, hRef);
 
   float *dA = nullptr, *dB = nullptr, *dC = nullptr;
   CUDA_CHECK(cudaMalloc(&dA, hA.size() * sizeof(float)));
@@ -42,7 +42,9 @@ bool RunCase(int M, int N, int K) {
   CUDA_CHECK(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
   auto [max_abs, max_rel] = MaxErrors(hRef, hC);
-  bool ok = launched_ok && max_rel < 5e-2f; // FP16 input precision tolerance
+  // FP16 operands have ~3 mantissa digits; compare on absolute error like
+  // stage 3 (relative error blows up when the reference is near zero).
+  bool ok = launched_ok && max_abs < 5e-2f;
   std::printf("[cutlass_gemm_fp16] M=%d N=%d K=%d launched_ok=%d "
              "max_abs_err=%.6g max_rel_err=%.6g -> %s\n",
              M, N, K, launched_ok, max_abs, max_rel, ok ? "PASS" : "FAIL");

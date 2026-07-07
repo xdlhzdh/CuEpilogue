@@ -77,3 +77,12 @@ if(CU_EPILOGUE_ENABLE_CUDA AND TARGET fused_gemm_gelu)
 else()
   message(STATUS "CuEpilogue: skipping cutlass_fused_gemm_gelu_runtime.so (CUDA stages disabled)")
 endif()
+
+# End-to-end latency benchmark (spec 3.4 acceptance: fused external-call
+# path vs. "基础指令展开" baseline) - see test/bench_fused_e2e.cu and
+# benchmark_e2e.sh. Only buildable when the CUDA stages are enabled, since
+# it links against the stage 3 fused_gemm_gelu kernel directly.
+if(CU_EPILOGUE_ENABLE_CUDA AND TARGET fused_gemm_gelu)
+  add_executable(bench_fused_e2e test/bench_fused_e2e.cu)
+  target_link_libraries(bench_fused_e2e PRIVATE fused_gemm_gelu)
+endif()

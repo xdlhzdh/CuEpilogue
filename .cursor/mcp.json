@@ -1,14 +1,15 @@
 {
   "mcpServers": {
     "memorix": {
-      "command": "memorix",
+      "command": "npx",
       "args": [
+        "memorix",
         "serve",
         "--global"
       ]
     },
     "code-review-graph": {
-      "command": "uvx",
+      "command": "/home/xdlhzdh/.local/bin/uvx",
       "args": [
         "code-review-graph",
         "serve"
@@ -16,18 +17,8 @@
       "cwd": "${currentProjectRoot}",
       "type": "stdio"
     },
-    "cloudbase-mcp": {
-      "command": "npx",
-      "args": ["@cloudbase/cloudbase-mcp@latest"]
-    },
-    "wechat-devtools": {
-      "command": "./scripts/start-wechat-mcp.sh",
-      "args": [],
-      "cwd": "${currentProjectRoot}",
-      "type": "stdio"
-    },
     "fetch": {
-      "command": "uvx",
+      "command": "/home/xdlhzdh/.local/bin/uvx",
       "args": [
         "mcp-server-fetch"
       ],
