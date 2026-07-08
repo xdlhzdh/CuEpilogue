@@ -2,7 +2,9 @@
 
 Fused GEMM + Epilogue (Fast-GELU) 自定义算子开发与编译器集成 —— 完整需求见 [docs/spec.md](docs/spec.md)。当前宿主机软硬件环境详情见 [docs/environment.md](docs/environment.md)。
 
-## 项目阶段概览
+## 项目主线
+
+本项目按四个阶段递进：先用手写 CUDA SGEMM 建立基线，再用 CUTLASS Tensor Core GEMM 提升吞吐，随后把 Fast-GELU 注入 CUTLASS Epilogue，最后用 MLIR pass 把 `linalg.matmul + linalg.generic` 改写成对外部 CUTLASS fused kernel 的调用。
 
 | 阶段 | 目录 | 内容 |
 | --- | --- | --- |
@@ -11,7 +13,7 @@ Fused GEMM + Epilogue (Fast-GELU) 自定义算子开发与编译器集成 ——
 | 3 | `03_fastgelu_epilogue/` | Inline PTX Fast-GELU Epilogue：`FastGeluPTX`（`ex2.approx` + `rcp.approx`）接入 CUTLASS Epilogue，GEMM 输出直接在寄存器里做激活 |
 | 4 | `04_compiler_integration/` | MLIR 编译器后端集成：`fused-opt` 在 Bufferization 后把 `linalg.matmul`+`linalg.generic` 替换为对外部 CUTLASS 算子 `.so` 的 `call` |
 
-四个阶段依次递进，均已实现；功能验证和性能验收结果见下文。
+四个阶段依次递进，均已实现；每个阶段的目的、运行方法和验收结果见下文「验收结果总览」。
 
 ## 目录结构
 
@@ -64,49 +66,63 @@ cmake --build build -j$(nproc)
 ./scripts/build_all.sh
 ```
 
-等价于依次执行下方「功能验证」里的 `ctest`、静态验证脚本和阶段四 fusion pass 测试。性能 benchmark（`ncu` / `nsys` / 大矩阵吞吐 / 端到端延迟）需要单独运行，见「性能验收」。
+等价于依次执行下方「验收结果总览」里的 `ctest`、静态验证脚本和阶段四 fusion pass 测试。`ncu` / `nsys` profile、大矩阵吞吐和端到端延迟 benchmark 耗时更长，需要单独运行。
 
-## 功能验证
+## 验收结果总览
 
-功能验证覆盖两类内容：**运行时正确性 / pass 行为测试**（`ctest`，其中阶段一~三需要真实 GPU 执行 kernel）和**静态指令级验证**（脚本，只需 `nvcc` 能生成目标架构的 PTX/SASS，不需要 GPU）。
+下面按阶段列出验收项。阶段一、二、四侧重正确性 + 性能；阶段三侧重**把 Fast-GELU 融进 CUTLASS 矩阵乘、确认走了 SFU 硬件指令、数值误差在 spec 允许范围内**——它不是「再跑一遍吞吐 benchmark」，融合带来的延迟收益在阶段四体现。
 
-| 测试 | 类型 | 目的 | 运行方法 | 环境依赖 | 本机结果 |
-| --- | --- | --- | --- | --- | --- |
-| `stage1_correctness_test` | `ctest` | 手写 SGEMM（naive + shared-memory tiling，含非整除 tile 尺寸）数值正确性，对比 CPU FP32 参考，为后续阶段建立性能/精度基线 | `cd build && ctest -R stage1_correctness_test --output-on-failure` | GPU；支持 sm_70 的 `nvcc` | ✓ 通过 |
-| `stage2_correctness_test` | `ctest` | CUTLASS FP16 Tensor Core GEMM 数值正确性，对比 FP16 量化后的 CPU 参考（`max_abs < 0.05`） | `cd build && ctest -R stage2_correctness_test --output-on-failure` | GPU；`nvcc`(sm_70)；CUTLASS（CMake FetchContent 自动拉取） | ✓ 通过 |
-| `verify_mma_ptx.sh` | 静态脚本 | 确认阶段二生成的 PTX 含 `mma.sync.aligned.m8n8k4`（真的触发了 Tensor Core），且无 `ld.local`/`st.local`（无寄存器溢出迹象） | `./02_cutlass_gemm/verify_mma_ptx.sh` | 只需 `nvcc`(sm_70)，**不需要 GPU** | ✓ 通过 |
-| `stage3_correctness_test` | `ctest` | 融合 GEMM+Fast-GELU 数值误差在推理可接受 ε 内（`max_abs_exact < 0.05`，即 SFU 近似引入的额外误差 `max_abs_sfu < 0.01`） | `cd build && ctest -R stage3_correctness_test --output-on-failure` | GPU；`nvcc`(sm_70) | ✓ 通过 |
-| `verify_sfu_sass.sh` | 静态脚本 | 确认阶段三 PTX 含 `ex2.approx`/`rcp.approx`，编译出的 SASS 含对应硬件指令 `MUFU.EX2`/`MUFU.RCP` | `./03_fastgelu_epilogue/verify_sfu_sass.sh` | 只需 `nvcc`(sm_70)，**不需要 GPU** | ✓ 通过 |
-| `stage4_fuse_gemm_gelu_test` | `ctest` / 脚本 | 验证 `fused-opt` 把 `linalg.matmul` + `linalg.generic`(GELU) 融合为对 `@cutlass_fused_gemm_gelu` 的外部调用，原始算子从 IR 中消失 | `cd build && ctest -R stage4 --output-on-failure` 或 `./04_compiler_integration/test/run_tests.sh build/04_compiler_integration/fused-opt` | LLVM/MLIR（`MLIRConfig.cmake`）；构建期仍需 `nvcc` 编译 runtime `.so`；**不需要 GPU 执行** | ✓ 通过 |
+| 阶段 | 阶段目的 | 验收方法 | 当前结果 |
+| --- | --- | --- | --- |
+| 1. Native CUDA SGEMM baseline | 用 naive / shared-memory tiled SGEMM 建立正确性、性能和 profile 基线 | `cd build && ctest -R stage1_correctness_test --output-on-failure`；`./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness_test` | `ctest` 通过；`nsys` + `ncu --set full` 报告已产出。256³ 下 `SgemmTiledSmemKernel` SM 吞吐 **51.8%** of peak、显存吞吐 **50.5%**、Achieved Occupancy **49.8%** |
+| 2. CUTLASS Tensor Core GEMM | 用 CUTLASS FP16 Tensor Core GEMM 替代阶段一手写 FP32 kernel，并验证吞吐显著提升 | `cd build && ctest -R stage2_correctness_test --output-on-failure`；`./02_cutlass_gemm/verify_mma_ptx.sh`；`./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096` | `ctest` 通过；PTX 含 `mma.sync.aligned.m8n8k4`；4096³ 下阶段一 **3.05 TFLOPS**、阶段二 **36.27 TFLOPS**，**11.9× 加速** |
+| 3. Fast-GELU Epilogue | 把 Fast-GELU 融合进 CUTLASS Epilogue，GEMM 输出在寄存器路径中完成激活，避免中间张量落显存 | `cd build && ctest -R stage3_correctness_test --output-on-failure`；`./03_fastgelu_epilogue/verify_sfu_sass.sh` | `ctest` 通过；PTX 含 `ex2.approx` / `rcp.approx`，SASS 含 `MUFU.EX2` / `MUFU.RCP`；`max_abs_exact < 0.05`，SFU 额外误差 `max_abs_sfu < 0.01` |
+| 4. MLIR compiler integration | 在 MLIR 后端识别 `linalg.matmul + linalg.generic`，改写为对外部 fused CUTLASS kernel 的调用 | `cd build && ctest -R stage4 --output-on-failure`；`./04_compiler_integration/benchmark_e2e.sh` | fusion pass 测试通过；20 次 fused 调用 **0.68ms**，未融合标量 CPU 循环 **148.3ms**，端到端延迟下降 **99.5%** |
 
-**`ctest` 汇总：4/4 通过**（`cd build && ctest --output-on-failure`；单独跑某阶段用 `ctest -R stage2` 等）。
+`ctest` 汇总：`cd build && ctest --output-on-failure` 当前 4/4 通过。
 
-## 性能验收
+### 阶段二：为什么 `ctest` 里阶段二看起来反而更慢？
 
-以下三项 spec 要求的性能验收，均已在本机实测。它们不属于 `scripts/build_all.sh` 的功能验证流程：`ncu`/`nsys` 采集通常需要较长时间，且本机 `ncu` 需要 `sudo` 访问性能计数器。
+一句话：**256×256 对 CUTLASS 来说太小了，GPU 大部分时间在空转，不能代表真实吞吐。**
 
-| 验收项 | 运行方法 | 结果 |
-| --- | --- | --- |
-| 阶段一 Profile（Occupancy / 显存带宽 vs. 理论峰值） | `./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness_test` | `nsys` + `ncu --set full` 报告均已产出（`01_baseline_cuda/profile_reports/`，已被 `.gitignore` 忽略）。256³：`SgemmTiledSmemKernel` SM 吞吐 **51.8%** of peak、显存吞吐 **50.5%** of peak、Achieved Occupancy **49.8%**；`SgemmNaiveKernel` 分别为 39.8% / 39.8% / 49.8% |
-| 阶段二吞吐量 vs. 阶段一 | 见下方「吞吐量对比方法」 | 小矩阵（256³，correctness test 用的尺寸）下 CUTLASS 反而因 grid 太小跑不满；换成 4096³ 大矩阵后：阶段一 **3.05 TFLOPS**，阶段二 **36.27 TFLOPS**，**11.9× 加速**，达标 spec"显著优于阶段一" |
-| 阶段四端到端延迟（融合 vs. 标量展开） | `./04_compiler_integration/benchmark_e2e.sh` | 融合外部调用 20 次共 **0.68ms**（34us/次）；未融合标量 CPU 循环 20 次共 **148.3ms**（7.4ms/次）。**延迟下降 99.5%**，远超 spec 的 30% 目标 |
+`stage1/2_correctness_test` 用 256³，是因为 CPU 参考实现也得在几秒内算完。但这个尺寸对阶段二不公平：
 
-**吞吐量对比方法**：正确性测试用的 256×256×256 矩阵是为“CPU 参考算得快”选的尺寸，对阶段二并不公平——`ncu` 数据显示 CUTLASS `ThreadblockShape<128,128,32>` 在 256×256 输出上只切出 `(2,2,1)=4` 个 threadblock，而 V100 有 80 个 SM，4 个 block 连 5% 的 SM 都占不满，Tensor Core 峰值算力根本没机会发挥，此时阶段二的 SM 吞吐（1.3% of peak）反而远低于阶段一（51.8%）。
+- CUTLASS 每个 threadblock 一次处理 128×128 的 tile → 256×256 的输出矩阵只需要 **4 个 block**
+- V100 有 **80 个 SM**，4 个 block 远远不够把 GPU 喂饱
+- 所以 `ncu` 里阶段二 SM 利用率只有 **1.3%**，反而低于阶段一（**51.8%**）——这不是 CUTLASS 不如手写 SGEMM，而是**矩阵太小，Tensor Core 没机会发力**
 
-`02_cutlass_gemm/bench_throughput_large`（直接链接阶段一、二的 kernel，不做 CPU 校验，纯粹测吞吐）在 **4096×4096×4096** 下重新对比：
+要看阶段二的真实表现，跑大矩阵吞吐 benchmark（不做 CPU 校验，只计时）：
 
 ```bash
 ./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096
-# [stage1] SgemmTiledSmem:   ~45.0 ms/call  (3.05 TFLOPS)
-# [stage2] CutlassGemmFp16:  ~3.8 ms/call  (36.27 TFLOPS)
-# speedup (stage1_ms / stage2_ms): 11.9x
+# [stage1] SgemmTiledSmem:   ~45.0 ms/次  (3.05 TFLOPS)
+# [stage2] CutlassGemmFp16:  ~3.8 ms/次   (36.27 TFLOPS)
+# 加速比: 11.9×
 ```
 
-`ncu`（`sudo /opt/nvidia/nsight-compute/2025.2.1/ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active,launch__grid_size --csv --page raw <bin>`）确认了这个规模下两边 grid 都已经打满 SM（阶段一 grid=16384 block、Occupancy 99.8%；阶段二 grid=1024 block）：阶段一 SM 吞吐 93.6% of *FP32 峰值*，阶段二 SM 吞吐 80.3% of *Tensor Core FP16 峰值*。**这两个百分比不能直接比大小**——阶段二对标的峰值（V100 Tensor Core ≈125 TFLOPS）本身是阶段一峰值（FP32 ≈15.7 TFLOPS）的约 8 倍，所以“80% of 大峰值”换算成绝对 TFLOPS 仍然是“93% of 小峰值”的 11.9 倍，与上面的实测 wall-clock 结果完全吻合。真正可比的是 TFLOPS 这个绝对数字，不是各自的“% of peak”。
+4096³ 下两边都能占满 GPU（阶段一约 16384 个 block、Occupancy 99.8%；阶段二约 1024 个 block）。读 `ncu` 时**不要直接比两边的 `% of peak`**——阶段一算 FP32 峰值，阶段二算 Tensor Core FP16 峰值，分母不同。**比实际耗时和 TFLOPS 就行。**
 
-**阶段四延迟对比的实现说明**：`04_compiler_integration/test/bench_fused_e2e.cu`（编译进 `bench_fused_e2e` 可执行文件）直接反复调用与编译器外部调用相同的 CUTLASS Fast-GELU kernel，绕开了 MLIR JIT 执行——因为 MLIR 的 bare-pointer 调用约定不支持*动态形状* memref 的函数声明，而 `EmitExternalCall.cpp` 为了通用性总是把算子签名规整成 `memref<?x?xf32>`。融合 pass 本身的正确性已由 `stage4_fuse_gemm_gelu_test` 单独覆盖。「未融合」侧则货真价实地跑了 `fused-opt`（不加 `--fuse-gemm-gelu`）→ `--convert-linalg-to-loops` → `mlir-runner` JIT 执行的标量 CPU 循环，对应 spec 3.4 的“基础指令展开”基线；已用双倍迭代次数验证耗时线性缩放（未被优化器提前求值/hoist）。
+### 阶段三：为什么不单独做吞吐 benchmark？
 
-### `ncu` 排障记录：两个问题，都已在 `profile.sh` 里自动处理
+阶段三要证明的不是「矩阵乘再快一倍」，而是两件事：
+
+1. **GELU 融进了 GEMM**——在寄存器里做完 `alpha·acc + beta·C` 后直接算 GELU，不必先把 GEMM 结果写回显存再读一遍
+2. **确实走了 SFU 硬件路径**（`ex2.approx` / `rcp.approx`），且数值误差在推理可接受范围内
+
+所以验收靠 `stage3_correctness_test`（数值）和 `verify_sfu_sass.sh`（PTX/SASS 里有没有 SFU 指令），不靠单独的吞吐测试。和「分开做 GEMM + GELU」比快慢，放到阶段四。
+
+### 阶段四：0.68 ms 和 148 ms 分别测了什么？
+
+| 对比项 | 实际在测什么 |
+| --- | --- |
+| **融合路径（0.68 ms / 20 次）** | 直接反复调用阶段三的 CUTLASS Fast-GELU kernel——和编译器融合后要调用的 CUDA 代码一模一样 |
+| **未融合路径（148 ms / 20 次）** | MLIR 把 `matmul + gelu` 展开成标量循环，在 CPU 上 JIT 执行——对应 spec 的「基础指令展开」基线，故意代表「没融合时的慢路径」 |
+
+融合侧为什么没走 `mlir-runner`？MLIR 的 bare-pointer 调用约定不支持动态形状 memref 的函数声明，而融合 pass 为了适配不同矩阵尺寸，签名写成了 `memref<?x?xf32>`。融合 pass 改 IR 对不对，已由 `stage4_fuse_gemm_gelu_test` 单独验证；这个 benchmark 只回答一个问题：**融合后的 GPU kernel 比展开循环快多少**。
+
+未融合侧已用双倍迭代次数确认耗时线性增长，排除「循环被编译器提前算完」的假象。
+
+### `ncu` 排障记录
 
 本机同时装了两个 Nsight Compute 版本（`/opt/nvidia/nsight-compute/{2025.2.1,2026.2.1}`），默认 `ncu`（`/usr/local/cuda-12.9/bin/ncu`）会自动选最新的 2026.2.1，但它比本机的 535.309.01 驱动新，一跑就报 `Nsight Compute failed to connect to the CUDA driver (stub libcuda.so[.1] on path?)`——这条报错**具有误导性**：用 `strace` 追踪发现它其实成功 `open()` 到了真正的驱动 `libcuda.so.1`（`/lib/x86_64-linux-gnu/`），根本不是 stub 库路径问题，而是工具/驱动版本不兼容导致 `cuInit` 失败，NVIDIA 用了一个通用但不准确的错误文案。换成同机已装的旧版 `2025.2.1` 后，才得到真正有用的报错：
 
@@ -120,13 +136,18 @@ cmake --build build -j$(nproc)
 
 ## 技术要点速览
 
-- **数据类型/Layout**（阶段二）：A/B 为 `cutlass::half_t`（FP16）Row-Major，累加器/输出为 FP32 Row-Major，与阶段一的 CPU 参考实现共用同一套正确性比较工具（`common/matrix_ref.hpp`）。
-- **Threadblock/Warp Tiling**（阶段二/三）：`ThreadblockShape<128,128,32>` / `WarpShape<64,64,32>` / `InstructionShape<8,8,4>`（Volta HMMA `mma.sync.aligned.m8n8k4`），`NumStages=2`（Volta 无 `cp.async`，不支持深层软件流水线）。
-- **Fast-GELU Inline PTX**（阶段三）：`03_fastgelu_epilogue/fast_gelu_ptx.cuh` 中的 `FastGeluPTX` 与 spec 给出的代码完全一致；`fast_gelu_epilogue_op.cuh` 把它包装成与 `cutlass::epilogue::thread::LinearCombination` 接口兼容的 Epilogue functor，直接替换 CUTLASS `device::Gemm` 模板的 `EpilogueOutputOp` 参数。
-- **MLIR Pattern Fusion**（阶段四）：`04_compiler_integration/lib/FuseGemmGeluPattern.cpp` 在 Bufferization 之后的 `func.func` 内扫描 "matmul 的输出唯一地被一个全 parallel、identity-map 的 `linalg.generic` 消费" 这一结构模式；`lib/EmitExternalCall.cpp` 负责校验操作数的 rank/元素类型/内存布局（对应 spec 风险点"IR 语义不对齐"），并把匹配到的两个算子替换成对 `@cutlass_fused_gemm_gelu` 的 `func.call`。`runtime/cutlass_fused_gemm_gelu_c_api.cu` 把阶段三的 kernel 包装成这个符号对应的 C ABI，编译进 `libcutlass_fused_gemm_gelu_runtime.so`。
+- **阶段一：手写 CUDA 矩阵乘**（`01_baseline_cuda/`）：`sgemm_naive.cu` 是最直白的写法——一个线程算结果矩阵里的一个数，K 维每走一步就从显存读一次 A、B，重复读很多。`sgemm_tiled_smem.cu` 改进为先把一小块 A/B 搬进 shared memory，块内线程复用这块数据，少读显存。算得对不对，用 `common/matrix_ref.hpp` 里的 CPU 参考实现对照（内部用 double 累加，避免参考本身有误差）；后面阶段沿用同一套比对工具。
+- **阶段二：换成 CUTLASS + Tensor Core**（`02_cutlass_gemm/cutlass_gemm.cu`）：不再手写乘加循环，改用 NVIDIA 的 CUTLASS 库，让 V100 的 Tensor Core 干矩阵乘（编译后能看到 `mma.sync.aligned.m8n8k4` 指令）。输入矩阵用 FP16 省带宽，累加和输出仍用 FP32 保精度。一次处理 128×128 的子块（`ThreadblockShape<128,128,32>`）；Volta 没有 `cp.async`，流水线只能做 2 级，没法像新卡那样叠很多层预取。阶段三在**同一套矩阵乘配置**上，只改「乘完之后干什么」。
+- **阶段三：乘完立刻算 GELU，不落显存**（`03_fastgelu_epilogue/`）：普通做法是 GEMM 先把结果写回显存，再另起一个 kernel 做 GELU。这里把 GELU 塞进 CUTLASS 的 epilogue——矩阵乘累加完成后，在寄存器里直接做 `α·acc + β·C`，紧接着用 `FastGeluPTX`（`fast_gelu_ptx.cuh`）算 GELU，全程不经过中间张量。GELU 走 GPU 的 SFU 近似指令（`ex2.approx` / `rcp.approx`），`fast_gelu_epilogue_op.cuh` 把它包装成 CUTLASS 能识别的 epilogue 接口，替换原来的线性组合输出。
+- **阶段四：编译器认出「矩阵乘 + GELU」并合成一次调用**（`04_compiler_integration/`）：`FuseGemmGeluPattern.cpp` 在 MLIR 里找这样的模式——`linalg.matmul` 的输出**只**被一个逐元素激活（GELU）消费，且两者已经 bufferize 成内存上的张量。匹配成功就把两个算子删掉，改成调用外部函数 `@cutlass_fused_gemm_gelu`。`EmitExternalCall.cpp` 在生成调用前检查张量是不是 2D、是不是 f32、布局对不对，不对就直接报错，避免生成错误的 C 接口。`runtime/cutlass_fused_gemm_gelu_c_api.cu` 把阶段三的 kernel 包成这个外部函数，打进 `libcutlass_fused_gemm_gelu_runtime.so`，供 MLIR 生成的代码链接调用。
 
-## 关键风险与排查（对应 spec 第 4 节）
+## 关键风险与当前状态（对应 spec 第 4 节）
 
-- **寄存器溢出**：`verify_mma_ptx.sh` / `verify_sfu_sass.sh` 会顺带统计生成 PTX 中 `ld.local`/`st.local` 的出现次数；当前配置下均为 0。
-- **访存合并失败**：已用 `ncu` 覆盖阶段一/二核心吞吐指标；进一步定位访存合并问题时，可结合 `l1tex__data_bank_conflicts` 等细分指标，以及 SASS 里 `LDG.128`/`STG.128` 的向量化情况确认。
-- **IR 语义不对齐**：`EmitExternalCall.cpp` 的 `validateOperand()` 在 emit 调用前严格检查 rank==2、元素类型为 f32、内存布局为 identity（连续 row-major），任何不匹配都会让 pass 报编译期错误而不是静默生成错误的调用。
+本节列的是 spec 要求关注的三类技术风险，以及本项目当前的排查结果。**“风险”指需要警惕的问题类型，不等于当前一定出了 bug。**
+
+| 风险 | 风险是什么 | 当前状态 | 怎么查 / 已有防护 |
+| --- | --- | --- | --- |
+| 寄存器溢出 | CUTLASS tile 或 epilogue 过大时，线程寄存器不够用，编译器会把数据溢出到 local memory，kernel 变慢、occupancy 下降 | **已验证，当前无溢出** | `verify_mma_ptx.sh` / `verify_sfu_sass.sh` 统计 PTX 中 `ld.local` / `st.local`；当前配置下均为 **0**。若以后改 tile 配置，需重跑这两个脚本 |
+| 访存合并失败 | Epilogue 写回 global memory 时未形成高效向量化访问，带宽利用变差 | **核心指标已验证，细分项可继续深入** | 阶段一/二已有 `ncu` 核心吞吐数据；若继续定位，可看 `l1tex__data_bank_conflicts`、global load/store transaction，以及 SASS 中 `LDG.128` / `STG.128` |
+| IR 语义不对齐 | MLIR 侧 memref 的 rank、dtype、stride/layout 与底层 CUTLASS C API 不一致，可能生成错误外部调用 | **已有编译期防护** | `EmitExternalCall.cpp::validateOperand()` 要求 rank==2、f32、identity layout；不满足则 pass 直接报错，不会静默生成错误 ABI |
+| 动态形状 memref JIT 调用 | MLIR bare-pointer 约定下，动态形状 memref 难以直接 JIT 调用外部 fused kernel | **已在 benchmark 设计中规避** | 阶段四 fused 性能侧用 `bench_fused_e2e` 直接调 C++ kernel；fusion pass 行为由 `stage4_fuse_gemm_gelu_test` 单独覆盖 |

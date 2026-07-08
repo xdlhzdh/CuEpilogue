@@ -2,7 +2,7 @@
 
 记录 CuEpilogue 当前宿主机的软硬件环境、关键版本选择的原因，以及历史沙盒背景。
 
-各阶段测试的**目的 / 运行方法 / 环境依赖 / 结果**见 [README「测试说明」](../README.md#测试说明)，本文档只覆盖机器本身的环境状态。
+各阶段测试的**目的 / 运行方法 / 环境依赖 / 结果**见 [README「验收结果总览」](../README.md#验收结果总览)，本文档只覆盖机器本身的环境状态。
 
 ## 1. 硬件与系统
 
@@ -37,9 +37,14 @@ nvcc fatal : Unsupported gpu architecture 'sm_70'
 sudo update-alternatives --config cuda   # 选择 /usr/local/cuda-12.9
 ```
 
-### `ncu` 需要 `sudo` + 正确的版本
+### `ncu` 需要兼容版本 + `sudo`
 
-本机 NVIDIA 驱动把 GPU 性能计数器访问限制为 admin-only（`RmProfilingAdminOnly=1`），所以 `ncu` 必须用 `sudo` 运行，否则报 `ERR_NVGPUCTRPERM`。另外本机装了两个 Nsight Compute 版本，默认解析到的 `/usr/local/cuda-12.9/bin/ncu` 会自动选中最新的 `2026.2.1`，但它与 535.309.01 驱动不兼容，报错是**具有误导性**的 `failed to connect to the CUDA driver (stub libcuda.so[.1] on path?)`（用 `strace` 验证过，它其实成功加载了真实驱动库，并非 stub 库路径问题）。用同机已装的旧版 `2025.2.1` 就能连上并给出真正的报错/数据。`01_baseline_cuda/profile.sh` 已经把“探测可用版本 + sudo”这套逻辑自动化了，直接跑脚本即可，细节见 README「`ncu` 排障记录」。
+本机跑 `ncu` 需要同时处理两个问题：
+
+1. **版本兼容**：默认 `ncu` 会选较新的 `2026.2.1`，但它与驱动 535.309.01 不兼容，会误报 `failed to connect to the CUDA driver (stub libcuda.so[.1] on path?)`。实际并不是 stub `libcuda.so` 路径问题，而是工具/驱动版本不匹配；需改用 `/opt/nvidia/nsight-compute/2025.2.1/ncu`。
+2. **性能计数器权限**：驱动默认 `RmProfilingAdminOnly=1`，普通用户不能读 GPU 性能计数器，必须对 `ncu` 本身使用 `sudo`，否则报 `ERR_NVGPUCTRPERM`。
+
+`01_baseline_cuda/profile.sh` 已经把“探测兼容版本 + sudo”自动化，直接跑脚本即可；细节见 README「`ncu` 排障记录」。
 
 ### 架构相关配置（Volta / V100）
 
@@ -56,4 +61,4 @@ spec 建议 Ampere 及以上架构，但本项目实际目标硬件是 Volta，�
 - 阶段一～三：仅完成编译 + 静态 PTX/SASS 指令验证，正确性测试和 Profile 因无 GPU 无法运行。
 - 阶段四（MLIR，不需要 GPU）：曾在沙盒内完整验证。
 
-当前 Linux Mint 宿主机已具备完整的 GPU + MLIR 环境，四个阶段的构建、正确性测试与静态验证均已在本机跑通（`ctest` 4/4 通过）。性能类验收数据（阶段一 Profile、阶段二吞吐量对比、阶段四端到端延迟）也已产出，详见 README「性能类验收结果」。唯一仍受限的是 `ncu --set full` 的详细 Occupancy/带宽指标——本机 NVIDIA 驱动把性能计数器访问限制为 admin-only（`RmProfilingAdminOnly=1`），且 `sudo` 下依旧失败，判断是虚拟化/云 GPU 层面的额外限制，需要真正的宿主机 root 权限（甚至云厂商配合）才能解锁，详见 README 对应章节。
+当前 Linux Mint 宿主机已具备完整的 GPU + MLIR 环境，四个阶段的构建、正确性测试与静态验证均已在本机跑通（`ctest` 4/4 通过）。阶段一 profile、阶段二吞吐量对比、阶段三 SFU 指令/误差验证、阶段四端到端延迟数据也已产出，详见 README「验收结果总览」。`ncu --set full` 采集需要使用兼容版本（本机为 `2025.2.1`）并以 `sudo` 运行；`01_baseline_cuda/profile.sh` 已自动处理这两点。
