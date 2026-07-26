@@ -28,7 +28,7 @@ Native CUDA baseline
 | `common/` | CUDA error check、CPU reference GEMM、随机输入、误差统计 |
 | `01_baseline_cuda/` | 手写 naive SGEMM 和 shared-memory tiled SGEMM；建立 profile 基线 |
 | `02_cutlass_gemm/` | CUTLASS FP16 Tensor Core GEMM；PTX `mma.sync` 验证；大矩阵吞吐 benchmark |
-| `03_fastgelu_epilogue/` | Fast-GELU inline PTX；CUTLASS Epilogue output op；SFU 指令验证 |
+| `03_fastgelu_epilogue/` | Fast-GELU inline PTX；functor epilogue（Sm70）与 Sm90 visitor（`LinCombEltAct` / EVT）；SFU 指令验证 |
 | `04_compiler_integration/` | MLIR pass、external call emission、runtime C ABI、端到端 benchmark |
 | `scripts/` | 一键构建和功能验证 |
 | `docs/` | spec、环境说明和本学习手册 |
@@ -164,6 +164,17 @@ inline float RoundToFp16(float value) {
 D = FastGELU(alpha * accumulator + beta * source)
 ```
 
+同一套 Inline PTX Fast-GELU（`FastGeluPTX`）有两条并存注入路径：
+
+| 路径 | API | 目标架构 | 默认 / 阶段四 |
+| --- | --- | --- | --- |
+| **Functor**（2.x 风格） | `device::Gemm` + `FastGeluLinearCombination` | Sm70（默认 `CU_EPILOGUE_CUDA_ARCH`） | 是，阶段四 runtime 调用它 |
+| **Visitor / EVT**（3.x） | `CollectiveBuilder` + `fusion::LinCombEltAct<FastGelu>` | Hopper `sm_90a` | 旁路；需 `-DCU_EPILOGUE_ENABLE_SM90_VISITOR=ON`（默认 ON） |
+
+说明：仓库拉取的是 CUTLASS **v3.5.1**，但 functor 路径仍使用其中兼容 2.x 的 `cutlass::gemm::device::Gemm` API。真·3.x visitor（`FusionCallbacks` / `Sm90EVT`）只在 Hopper 上完整可用；编译 visitor 目标时必须用 **`sm_90a`**（不是 plain `sm_90`），否则 WGMMA kernel 会退化成仅 `printf` 的 stub。
+
+### 5.1 Functor 路径（默认）
+
 重点文件：
 
 - `03_fastgelu_epilogue/fast_gelu_ptx.cuh`
@@ -209,11 +220,46 @@ cd build && ctest -R stage3_correctness_test --output-on-failure
 cd .. && ./03_fastgelu_epilogue/verify_sfu_sass.sh
 ```
 
+### 5.2 Visitor 路径（Sm90 EVT 旁路）
+
+重点文件：
+
+- `03_fastgelu_epilogue/fast_gelu_activation.cuh` — CUTLASS 风格 `FastGelu` activation（供 `LinCombEltAct`）
+- `03_fastgelu_epilogue/fused_gemm_gelu_visitor_sm90.cu`
+- `03_fastgelu_epilogue/correctness_test_visitor.cu` — GPU cc &lt; 90 时 SKIP（exit 0）
+- `03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh` — 静态 PTX/SASS 检查: 离线用 `nvcc -arch=sm_90a` 生成 PTX/cubin，再 `grep`/`cuobjdump` 查有没有 SFU 指令（不启动 GPU、不算矩阵）
+
+核心配置示意：
+
+```cpp
+using FusionOperation =
+    cutlass::epilogue::fusion::LinCombEltAct<FastGelu, ElementD, ElementCompute,
+                                             ElementC, ElementScalar>;
+using CollectiveEpilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, ...
+        EpilogueSchedule, FusionOperation>::CollectiveOp;
+```
+
+`LinCombEltAct` 由 CollectiveBuilder 展开为 `Sm90EVT` / `FusionCallbacks` 树：先做 `alpha * acc + beta * C`，再对每个元素调用 `FastGelu`（内部仍是同一套 SFU PTX）。
+
+建议运行：
+
+```bash
+cmake -B build -DCU_EPILOGUE_ENABLE_SM90_VISITOR=ON
+cmake --build build -j$(nproc) --target fused_gemm_gelu_visitor_sm90
+./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh
+cd build && ctest -R stage3_visitor_correctness_test --output-on-failure
+```
+
+在 V100 上：编译 + `verify_sfu_visitor_sm90.sh` 可通过；`stage3_visitor_correctness_test` 会打印 SKIP。设备 correctness 需要 Hopper（cc ≥ 90）。
+
 学习重点：
 
 - 为什么 GELU 放在 epilogue 里可以避免中间张量显存读写。
 - 为什么要用 SFU 近似指令，而不是普通 `expf` 展开。
 - 数值验收为什么看绝对误差和 SFU 额外误差，而不是只看相对误差。
+- Functor（替换 `LinearCombination`）与 Visitor（`LinCombEltAct` → EVT 树）的接口差异，以及为何 3.x visitor 绑定 Hopper `sm_90a`。
 
 ## 6. 阶段四：MLIR 编译器集成
 
@@ -280,7 +326,8 @@ cd .. && ./04_compiler_integration/benchmark_e2e.sh
 | 只跑 CUDA correctness | `cd build && ctest -R stage[1-3] --output-on-failure` | 数值误差和 CUDA runtime 是否正常 |
 | 只跑 MLIR pass test | `cd build && ctest -R stage4 --output-on-failure` | IR 中 matmul/generic 是否被替换 |
 | 验证 Tensor Core 指令 | `./02_cutlass_gemm/verify_mma_ptx.sh` | `mma.sync.aligned.m8n8k4`、无 `ld.local/st.local` |
-| 验证 SFU 指令 | `./03_fastgelu_epilogue/verify_sfu_sass.sh` | `ex2.approx`、`rcp.approx`、`MUFU.EX2`、`MUFU.RCP` |
+| 验证 SFU 指令（functor） | `./03_fastgelu_epilogue/verify_sfu_sass.sh` | `ex2.approx`、`rcp.approx`、`MUFU.EX2`、`MUFU.RCP` |
+| 验证 SFU 指令（Sm90 visitor） | `./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh` | 同上，且需 `sm_90a` 才有真实 WGMMA 主体 |
 | 阶段一 profile | `./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness_test` | `nsys` timeline、`ncu` SM/memory/occupancy |
 | 阶段二吞吐 | `./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096` | TFLOPS 和 speedup |
 | 阶段四延迟 | `./04_compiler_integration/benchmark_e2e.sh` | fused/unfused 总耗时和 latency change |
@@ -302,7 +349,7 @@ cd .. && ./04_compiler_integration/benchmark_e2e.sh
 | 第 2 天 | 学阶段一，读 `sgemm_naive.cu` / `sgemm_tiled_smem.cu` / `matrix_ref.hpp`，跑 stage1 correctness | 能解释 naive 与 tiled 的访存差异 |
 | 第 3 天 | 跑 `profile.sh`，看 `nsys`/`ncu` 指标 | 能读懂 SM throughput、memory throughput、occupancy |
 | 第 4 天 | 学阶段二，读 CUTLASS 模板配置，跑 `verify_mma_ptx.sh` 和大矩阵 benchmark | 能解释 Tensor Core 指令和小/大矩阵差异 |
-| 第 5 天 | 学阶段三，读 `FastGeluPTX` 和 epilogue op，跑 SFU 验证 | 能解释 inline PTX 和误差验收 |
+| 第 5 天 | 学阶段三 functor 路径，读 `FastGeluPTX` 和 epilogue op，跑 SFU 验证；再对照 Sm90 visitor 文件与 `verify_sfu_visitor_sm90.sh` | 能解释 functor vs visitor 与 SFU 误差验收 |
 | 第 6 天 | 学阶段四，读 pattern matching 和 external call emission，跑 stage4 test | 能解释 MLIR IR 如何变成外部 fused call |
 | 第 7 天 | 跑端到端 benchmark，整理自己的实验笔记 | 能复述完整 pipeline 和每个验收数据的含义 |
 

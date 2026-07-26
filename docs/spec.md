@@ -39,7 +39,9 @@
 *   **实现细节:** 
     *   基于 GELU 的代数近似公式：
         $$ \text{GELU}(x) \approx \frac{x}{1 + 2^{-2.455492 \cdot x}} $$
-    *   **代码注入:** 在 CUTLASS Epilogue Functor 中嵌入以下 Inline PTX 汇编逻辑：
+    *   **代码注入（两条并存路径，同一套 SFU PTX）：**
+        1. **Functor（默认，Sm70 / 阶段四 runtime）：** 在 CUTLASS 2.x 风格 Epilogue Output Op（`FastGeluLinearCombination`，替换 `LinearCombination`）中嵌入 Inline PTX。
+        2. **Visitor / EVT（旁路，Hopper）：** 通过 CUTLASS 3.x `CollectiveBuilder` + `epilogue::fusion::LinCombEltAct<FastGelu>`（底层 `Sm90EVT` / `FusionCallbacks`）注入同一激活。需 `-DCU_EPILOGUE_ENABLE_SM90_VISITOR=ON`。编译时 nvcc 目标架构须为 `sm_90a`（plain `sm_90` 会生成空 stub）；在 GPU 上做数值 correctness 则需 Hopper（compute capability ≥ 9.0），否则 correctness 会 SKIP（仍可做编译与静态 PTX/SASS 检查）。
 
 ```cpp
 struct FastGeluPTX {
@@ -63,7 +65,7 @@ struct FastGeluPTX {
 };
 ```
 
-- **验收标准:** NCU 指令分析中确认 SFU（Special Function Unit）指令 `ex2.approx` 和 `rcp.approx` 被成功调用，且数值误差在 AI 推理允许的 $\epsilon$ 范围内。
+- **验收标准:** 静态 PTX/SASS（或 NCU）中确认 SFU 指令 `ex2.approx` / `rcp.approx`（及对应 SASS `MUFU.*`）存在；数值误差在 AI 推理允许的 $\epsilon$ 范围内。Visitor 路径的编译架构与 GPU 要求见上文实现细节。
 
 ### 阶段四：AI 编译器后端集成 (Compiler Backend Emission)
 

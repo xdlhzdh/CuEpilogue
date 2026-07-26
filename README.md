@@ -10,7 +10,7 @@ Fused GEMM + Epilogue (Fast-GELU) 自定义算子开发与编译器集成 ——
 | --- | --- | --- |
 | 1 | `01_baseline_cuda/` | Native CUDA SGEMM：无 tiling 版本 + Shared Memory tiling 版本，作为性能/精度基准 |
 | 2 | `02_cutlass_gemm/` | CUTLASS GEMM：FP16 输入 / FP32 累加，配置 Threadblock/Warp/Instruction Shape 触发 Tensor Core `mma.sync.aligned` |
-| 3 | `03_fastgelu_epilogue/` | Inline PTX Fast-GELU Epilogue：`FastGeluPTX`（`ex2.approx` + `rcp.approx`）接入 CUTLASS Epilogue，GEMM 输出直接在寄存器里做激活 |
+| 3 | `03_fastgelu_epilogue/` | Inline PTX Fast-GELU：functor（Sm70 `device::Gemm`）与 Sm90 visitor（`CollectiveBuilder` + `LinCombEltAct`）并存；阶段四默认走 functor |
 | 4 | `04_compiler_integration/` | MLIR 编译器后端集成：`fused-opt` 在 Bufferization 后把 `linalg.matmul`+`linalg.generic` 替换为对外部 CUTLASS 算子 `.so` 的 `call` |
 
 四个阶段依次递进，均已实现；每个阶段的目的、运行方法和验收结果见下文「验收结果总览」。
@@ -55,8 +55,9 @@ cmake --build build -j$(nproc)
 
 | 选项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `CU_EPILOGUE_CUDA_ARCH` | `70` | 目标 SM 架构（70/80/86/89/90...） |
+| `CU_EPILOGUE_CUDA_ARCH` | `70` | 目标 SM 架构（70/80/86/89/90...）；作用于阶段一～三 functor 路径 |
 | `CU_EPILOGUE_ENABLE_CUDA` | `ON` | 是否构建阶段一~三（需要 `nvcc`，找不到会自动关闭并给出警告） |
+| `CU_EPILOGUE_ENABLE_SM90_VISITOR` | `ON` | 是否构建阶段三 Sm90 visitor 旁路（单独编 `sm_90a`；设备 correctness 需 Hopper） |
 | `CU_EPILOGUE_ENABLE_MLIR` | `ON` | 是否构建阶段四（需要 `find_package(MLIR)` 成功） |
 | `CU_EPILOGUE_BUILD_TESTS` | `ON` | 是否注册 `ctest` 测试 |
 
@@ -76,7 +77,7 @@ cmake --build build -j$(nproc)
 | --- | --- | --- | --- |
 | 1. Native CUDA SGEMM baseline | 用 naive / shared-memory tiled SGEMM 建立正确性、性能和 profile 基线 | `cd build && ctest -R stage1_correctness_test --output-on-failure`；`./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness_test` | `ctest` 通过；`nsys` + `ncu --set full` 报告已产出。256³ 下 `SgemmTiledSmemKernel` SM 吞吐 **51.8%** of peak、显存吞吐 **50.5%**、Achieved Occupancy **49.8%** |
 | 2. CUTLASS Tensor Core GEMM | 用 CUTLASS FP16 Tensor Core GEMM 替代阶段一手写 FP32 kernel，并验证吞吐显著提升 | `cd build && ctest -R stage2_correctness_test --output-on-failure`；`./02_cutlass_gemm/verify_mma_ptx.sh`；`./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096` | `ctest` 通过；PTX 含 `mma.sync.aligned.m8n8k4`；4096³ 下阶段一 **3.05 TFLOPS**、阶段二 **36.27 TFLOPS**，**11.9× 加速** |
-| 3. Fast-GELU Epilogue | 把 Fast-GELU 融合进 CUTLASS Epilogue，GEMM 输出在寄存器路径中完成激活，避免中间张量落显存 | `cd build && ctest -R stage3_correctness_test --output-on-failure`；`./03_fastgelu_epilogue/verify_sfu_sass.sh` | `ctest` 通过；PTX 含 `ex2.approx` / `rcp.approx`，SASS 含 `MUFU.EX2` / `MUFU.RCP`；`max_abs_exact < 0.05`，SFU 额外误差 `max_abs_sfu < 0.01` |
+| 3. Fast-GELU Epilogue | 把 Fast-GELU 融合进 CUTLASS Epilogue，GEMM 输出在寄存器路径中完成激活，避免中间张量落显存 | Functor：`ctest -R stage3_correctness_test`；`./03_fastgelu_epilogue/verify_sfu_sass.sh`。Visitor：`./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh`；`ctest -R stage3_visitor`（cc&lt;90 时 SKIP） | Functor：`ctest` 通过；PTX/SASS 含 SFU。Visitor：`sm_90a` 下 PTX 含 `ex2.approx`/`rcp.approx`，SASS 含 `MUFU.EX2`/`MUFU.RCP`；V100 上 correctness SKIP |
 | 4. MLIR compiler integration | 在 MLIR 后端识别 `linalg.matmul + linalg.generic`，改写为对外部 fused CUTLASS kernel 的调用 | `cd build && ctest -R stage4 --output-on-failure`；`./04_compiler_integration/benchmark_e2e.sh` | fusion pass 测试通过；20 次 fused 调用 **0.68ms**，未融合标量 CPU 循环 **148.3ms**，端到端延迟下降 **99.5%** |
 
 `ctest` 汇总：`cd build && ctest --output-on-failure` 当前 4/4 通过。
@@ -109,7 +110,7 @@ cmake --build build -j$(nproc)
 1. **GELU 融进了 GEMM**——在寄存器里做完 `alpha·acc + beta·C` 后直接算 GELU，不必先把 GEMM 结果写回显存再读一遍
 2. **确实走了 SFU 硬件路径**（`ex2.approx` / `rcp.approx`），且数值误差在推理可接受范围内
 
-所以验收靠 `stage3_correctness_test`（数值）和 `verify_sfu_sass.sh`（PTX/SASS 里有没有 SFU 指令），不靠单独的吞吐测试。和「分开做 GEMM + GELU」比快慢，放到阶段四。
+所以验收靠 `stage3_correctness_test`（functor 数值）和 `verify_sfu_sass.sh`（PTX/SASS），外加旁路的 `verify_sfu_visitor_sm90.sh` / `stage3_visitor_correctness_test`（Hopper 或 SKIP）。和「分开做 GEMM + GELU」比快慢，放到阶段四；阶段四默认仍调用 functor 路径的 fused kernel。
 
 ### 阶段四：0.68 ms 和 148 ms 分别测了什么？
 

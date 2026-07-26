@@ -54,6 +54,15 @@ spec 建议 Ampere 及以上架构，但本项目实际目标硬件是 Volta，�
 - CUTLASS Tensor Core 形状使用 `InstructionShape<8,8,4>`，对应 PTX `mma.sync.aligned.m8n8k4`（而非 Ampere 的 `m16n8k8/k16`）
 - 流水线深度 `kStages=2`（Volta 无 `cp.async`，不支持更深的多级软件流水线）
 
+### Sm90 visitor 旁路（Hopper）
+
+阶段三另有一条 CUTLASS 3.x visitor / EVT 路径（`CU_EPILOGUE_ENABLE_SM90_VISITOR`，默认 ON）：
+
+- 该目标单独以 **`CUDA_ARCHITECTURES=90a`** 编译（WGMMA 需要 `__CUDA_ARCH_FEAT_SM90_ALL`；plain `sm_90` 会编出仅 `printf` 的 stub）
+- 不改变默认 `CU_EPILOGUE_CUDA_ARCH=70`，也不替换阶段四 runtime（仍走 Sm70 functor）
+- 本机 V100 上：可做编译 + `./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh` 静态验收；`stage3_visitor_correctness_test` 在 cc &lt; 90 时 SKIP
+- 关闭：`cmake -B build -DCU_EPILOGUE_ENABLE_SM90_VISITOR=OFF`
+
 ## 3. 历史：项目最初的 WSL2 沙盒环境
 
 项目最初在**没有 GPU 访问权限**的 WSL2 沙盒中搭建（Ubuntu 26.04, CUDA 12.4.131, LLVM/MLIR 23.0.0git）。该环境下：
