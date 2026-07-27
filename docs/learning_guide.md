@@ -27,7 +27,7 @@ Native CUDA baseline
 | --- | --- |
 | `common/` | CUDA error check、CPU reference GEMM、随机输入、误差统计 |
 | `01_baseline_cuda/` | 手写 naive SGEMM 和 shared-memory tiled SGEMM；建立 profile 基线 |
-| `02_cutlass_gemm/` | CUTLASS FP16 Tensor Core GEMM；PTX `mma.sync` 验证；大矩阵吞吐 benchmark |
+| `02_cutlass_gemm/` | CUTLASS Tensor Core **纯 GEMM** 基座（尚未融合 GELU）；`mma.sync` 验证与大矩阵吞吐 benchmark |
 | `03_fastgelu_epilogue/` | Fast-GELU inline PTX；functor epilogue（Sm70）与 Sm90 visitor（`LinCombEltAct` / EVT）；SFU 指令验证 |
 | `04_compiler_integration/` | MLIR pass、external call emission、runtime C ABI、端到端 benchmark |
 | `scripts/` | 一键构建和功能验证 |
@@ -99,16 +99,49 @@ cd .. && ./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness
 
 ## 4. 阶段二：CUTLASS Tensor Core GEMM
 
-阶段二把手写 FP32 SGEMM 换成 CUTLASS device-level GEMM，目标是触发 Volta Tensor Core HMMA 指令。
+### 4.1 这个目录到底在做什么
 
-重点文件：
+`02_cutlass_gemm/` **只做一件事**：把手写 FP32 SGEMM（阶段一）换成 CUTLASS 的 device-level Tensor Core GEMM，算出
 
-- `02_cutlass_gemm/cutlass_gemm.cu`
-- `02_cutlass_gemm/correctness_test.cu`
-- `02_cutlass_gemm/verify_mma_ptx.sh`
-- `02_cutlass_gemm/bench_throughput_large.cu`
+```text
+D = alpha * (A @ B) + beta * C
+```
 
-核心 CUTLASS 配置：
+没有 GELU，也没有第二个激活 kernel。目录里的工作可以拆成四块：
+
+| 文件 | 作用 |
+| --- | --- |
+| `cutlass_gemm.cu` / `.cuh` | 配置 `device::Gemm`（Sm70、FP16 输入、FP32 累加），封装 `CutlassGemmFp16` 启动入口 |
+| `correctness_test.cu` | 小矩阵上对比 CPU reference（A/B 先量化到 FP16） |
+| `verify_mma_ptx.sh` | 离线编译 PTX，确认出现 `mma.sync.aligned.m8n8k4`（不依赖 GPU 运行） |
+| `bench_throughput_large.cu` | 大矩阵计时，对比阶段一 tiled SGEMM 的 TFLOPS |
+
+`CutlassGemmFp16` 这个函数的调用流程分三步：
+
+1. **对外接口仍是 FP32**：`CutlassGemmFp16(M, N, K, alpha, A_fp32, B_fp32, beta, C_fp32, ...)` 的入参和阶段一的 SGEMM 函数长得一样，全是 `float*`。
+2. **内部先做一次 FP32 → FP16 的类型转换**：函数一开始会在 GPU 上额外跑一个小 kernel（`ConvertF32ToF16Kernel`），把 A、B 从 FP32 转成 FP16，存进两块新分配的临时显存里。真正喂给 CUTLASS Tensor Core 的是这两块 FP16 数据，C 全程仍是 FP32（Tensor Core 用 FP16 相乘、FP32 累加）。
+3. **调用 CUTLASS**：用转换后的 FP16 A/B 和原来的 FP32 C 构造 `Arguments`，依次调 `can_implement`（检查这个问题规模/类型合不合法）→ `initialize`（分配 workspace、绑定参数）→ `operator()`（真正跑 kernel），结果写回同一块 FP32 C。
+
+为什么对外接口还留着 FP32，而不是直接要求调用者传 FP16 数据？因为这样一来，`correctness_test.cu` 里生成随机数、`cudaMemcpy`、算误差的那套代码，可以跟阶段一测试 SGEMM 时用的完全是同一份（`common/matrix_ref.hpp` 里的 `FillRandom`、`MaxErrors` 等），不用为 FP16 单独写一套测试逻辑，方便阶段一和阶段二对比。但这也意味着每次调用都要多付一次「转换 kernel」的开销；真实产品部署时，模型权重会提前一次性转换成 FP16 存好（即数据本来就「常驻」FP16，不用每次现场转），直接把 FP16 指针传给 GEMM，省掉这一步。
+
+### 4.2 它算不算「算子融合」？
+
+**不算。** 这里的 GEMM 只算出 `D = alpha*(A@B) + beta*C`，没有任何激活函数。项目真正要消除的中间张量，是「GEMM 算完先写回显存 → GELU kernel 再读一遍」这一步，那一步要到**阶段三**才处理。
+
+容易搞混的地方在于：`cutlass_gemm.cu` 的注释里写着 "fused Device-level GEMM"，CUTLASS 官方文档也常说这类 GEMM 是「fused」的。但这里的「fused」指的是 CUTLASS **库内部**的实现方式——一个 GEMM kernel 把 mainloop（做矩阵乘法的 MMA 指令）和 epilogue（默认是 `LinearCombination`，也就是 `alpha*acc+beta*C`）一起编译进同一个 kernel，中间不需要再启动第二个 kernel。这是 CUTLASS 库自身的结构，跟本项目讲的「把 GELU 也融合进去」是两件不同的事，读到「fused」这个词时不要把两者混为一谈。
+
+用一张示意图区分两者：
+
+```text
+阶段二：搭好「会跑 Tensor Core 的 GEMM 机架」，epilogue 仍是 LinearCombination（只做线性组合，没有激活函数）
+阶段三：把机架上的 epilogue 换成 FastGeluLinearCombination（或 Sm90 visitor），才是本项目说的「算子融合」
+```
+
+所以学阶段二的真正目的，是为阶段三准备一个**可以直接换零件的底座**：阶段三的 `fused_gemm_gelu.cu` 几乎原样照抄这里的全部模板参数，只替换其中第 10 个参数（epilogue op）。如果跳过阶段二直接读阶段三，很容易看不出「阶段三到底改了哪一处」。
+
+`docs/spec.md` 里阶段二的标题写了「算子融合」，更准确的说法是：**为算子融合打基础的 CUTLASS 核心重构**；「融合」本身要到阶段三才真正验收。
+
+### 4.3 核心配置（必读）
 
 ```cpp
 using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
@@ -132,15 +165,9 @@ using CutlassGemmSm70 = cutlass::gemm::device::Gemm<
     kStages>;
 ```
 
-这里有一个容易忽略的正确性细节：GPU 侧 Tensor Core 使用 FP16 输入，因此 CPU reference 也要先把 A/B 量化到 FP16 再比较：
+正确性细节：GPU Tensor Core 吃 FP16，CPU reference 也要先把 A/B 量化到 FP16（`ReferenceGemmFp16InputsRowMajor` / `RoundToFp16`），否则比的是「未量化输入」和「已量化输入」两套不同问题。
 
-```cpp
-inline float RoundToFp16(float value) {
-  return __half2float(__float2half(value));
-}
-```
-
-吞吐对比要用大矩阵。256³ 的 correctness size 只产生 4 个 CUTLASS threadblock，远远不够填满 V100 的 80 个 SM；4096³ 才能体现 Tensor Core 的优势：
+吞吐要用大矩阵。256³ 的 correctness 尺寸只有 4 个 CUTLASS threadblock，喂不饱 V100 的 80 个 SM；4096³ 才能体现 Tensor Core：
 
 ```bash
 ./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096
@@ -149,12 +176,21 @@ inline float RoundToFp16(float value) {
 # speedup: 11.9x
 ```
 
-学习重点：
+### 4.4 建议学习顺序
 
-- `ElementA/B = cutlass::half_t` 与 `ElementAccumulator = float` 的含义。
-- `ThreadblockShape`、`WarpShape`、`InstructionShape` 如何对应底层 `mma.sync.aligned.m8n8k4`。
-- 为什么 correctness 用小矩阵，performance 要用大矩阵。
-- `ncu` 的 `% of peak` 必须看清楚分母：FP32 peak 和 Tensor Core FP16 peak 不是同一个峰值。
+1. **先建立定位**：明确本目录输出是纯 GEMM，不是 fused GELU；对照打开 `03_fastgelu_epilogue/fused_gemm_gelu.cu`，看哪些 typedef 一字不差、哪里只换成了 `FastGeluEpilogueOp`。
+2. **读 `cutlass_gemm.cu`**：搞清 `ElementA/B=half_t`、`ElementAccumulator=float`、`OpClassTensorOp`、`Sm70`、`kStages=2`（Volta 无 `cp.async`）各自约束什么。
+3. **认 epilogue 插槽**：盯住模板参数里的 `LinearCombination`——阶段三要替换的就是它；此时它只做线性组合。
+4. **跑正确性**：`cd build && ctest -R stage2_correctness_test --output-on-failure`，理解为何 reference 要 FP16 预量化、为何 tolerance 比阶段一松。
+5. **静态指令验收**：`./02_cutlass_gemm/verify_mma_ptx.sh`，确认 PTX 里有 `mma.sync.aligned.m8n8k4`（不要求 GPU 运行）。
+6. **大矩阵吞吐**：`./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096`；读 `ncu` 时分清 FP32 peak 与 Tensor Core FP16 peak 分母不同。
+7. **再进阶段三**：带着「epilogue 是可替换的最后一个模板参数」这一印象去读 Fast-GELU 注入。
+
+学习重点自检：
+
+- 能否用一句话说清：阶段二不是融合，阶段三才是。
+- `ThreadblockShape` / `WarpShape` / `InstructionShape` 如何落到 `mma.sync.aligned.m8n8k4`。
+- 为什么 correctness 用小矩阵、performance 必须用大矩阵。
 
 ## 5. 阶段三：Fast-GELU Epilogue
 
@@ -166,12 +202,14 @@ D = FastGELU(alpha * accumulator + beta * source)
 
 同一套 Inline PTX Fast-GELU（`FastGeluPTX`）有两条并存注入路径：
 
-| 路径 | API | 目标架构 | 默认 / 阶段四 |
-| --- | --- | --- | --- |
-| **Functor**（2.x 风格） | `device::Gemm` + `FastGeluLinearCombination` | Sm70（默认 `CU_EPILOGUE_CUDA_ARCH`） | 是，阶段四 runtime 调用它 |
-| **Visitor / EVT**（3.x） | `CollectiveBuilder` + `fusion::LinCombEltAct<FastGelu>` | Hopper `sm_90a` | 旁路；需 `-DCU_EPILOGUE_ENABLE_SM90_VISITOR=ON`（默认 ON） |
+| 路径 | API | 编译目标架构 | 是否默认路径 | 阶段四会用它吗 |
+| --- | --- | --- | --- | --- |
+| **Functor**（2.x 风格） | `device::Gemm` + `FastGeluLinearCombination` | Sm70（跟随 `CU_EPILOGUE_CUDA_ARCH`，默认 70） | 是 | 会 |
+| **Visitor / EVT**（3.x） | `CollectiveBuilder` + `fusion::LinCombEltAct<FastGelu>` | Hopper，编译时需用 `sm_90a` | 否，是旁路（`CU_EPILOGUE_ENABLE_SM90_VISITOR` 默认开着，但只表示「默认会被编译」，不代表它是主线路径） | 不会 |
 
-说明：仓库拉取的是 CUTLASS **v3.5.1**，但 functor 路径仍使用其中兼容 2.x 的 `cutlass::gemm::device::Gemm` API。真·3.x visitor（`FusionCallbacks` / `Sm90EVT`）只在 Hopper 上完整可用；编译 visitor 目标时必须用 **`sm_90a`**（不是 plain `sm_90`），否则 WGMMA kernel 会退化成仅 `printf` 的 stub。
+说明：仓库通过 CMake 拉取的是 CUTLASS **v3.5.1**，但 functor 路径用的是其中兼容 2.x 的 `cutlass::gemm::device::Gemm` API，并不是 3.x 的新接口。
+
+真正的 3.x visitor（`FusionCallbacks` / `Sm90EVT`）目前只有 Hopper 架构才完整支持。编译 visitor 目标时，nvcc 的目标架构必须写成 **`sm_90a`**（注意末尾的 `a`），不能只写 `sm_90`——否则编译器只会生成一个 `printf` 报错的空壳 kernel，不会真正执行任何 WGMMA 计算。
 
 ### 5.1 Functor 路径（默认）
 
@@ -226,8 +264,8 @@ cd .. && ./03_fastgelu_epilogue/verify_sfu_sass.sh
 
 - `03_fastgelu_epilogue/fast_gelu_activation.cuh` — CUTLASS 风格 `FastGelu` activation（供 `LinCombEltAct`）
 - `03_fastgelu_epilogue/fused_gemm_gelu_visitor_sm90.cu`
-- `03_fastgelu_epilogue/correctness_test_visitor.cu` — GPU cc &lt; 90 时 SKIP（exit 0）
-- `03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh` — 静态 PTX/SASS 检查: 离线用 `nvcc -arch=sm_90a` 生成 PTX/cubin，再 `grep`/`cuobjdump` 查有没有 SFU 指令（不启动 GPU、不算矩阵）
+- `03_fastgelu_epilogue/correctness_test_visitor.cu` — 如果当前 GPU 的 compute capability 低于 9.0（不是 Hopper），测试会直接 SKIP（exit 0），不算失败
+- `03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh` — 只做静态检查：用 `nvcc -arch=sm_90a` 离线生成 PTX/cubin，再用 `grep` / `cuobjdump` 确认里面有没有 SFU 指令；全程不需要真的启动 GPU 或算一次矩阵乘
 
 核心配置示意：
 
@@ -252,7 +290,7 @@ cmake --build build -j$(nproc) --target fused_gemm_gelu_visitor_sm90
 cd build && ctest -R stage3_visitor_correctness_test --output-on-failure
 ```
 
-在 V100 上：编译 + `verify_sfu_visitor_sm90.sh` 可通过；`stage3_visitor_correctness_test` 会打印 SKIP。设备 correctness 需要 Hopper（cc ≥ 90）。
+在 V100 上会发生什么：编译能通过，`verify_sfu_visitor_sm90.sh` 的静态检查也能通过；但 `stage3_visitor_correctness_test` 会打印 SKIP 并直接退出——因为它要求 GPU 的 compute capability ≥ 9.0（即 Hopper 及更新架构），而 V100 只有 7.0，达不到要求。
 
 学习重点：
 
@@ -314,7 +352,7 @@ cd .. && ./04_compiler_integration/benchmark_e2e.sh
 学习重点：
 
 - 为什么 pass 要在 bufferization 后匹配 memref-based `linalg.matmul`。
-- 为什么 matmul 输出必须只有一个 activation consumer。
+- 为什么 matmul 的输出只能被一个 activation 算子消费（即只能接一个下游 consumer）。
 - 为什么 external call 前必须做 rank/type/layout 校验。
 - 为什么当前 benchmark fused 侧直接调用 C++ 可执行文件，而 fusion 行为由单独的 pass test 覆盖。
 
@@ -348,7 +386,7 @@ cd .. && ./04_compiler_integration/benchmark_e2e.sh
 | 第 1 天 | 阅读 `README.md`、`docs/spec.md`、`docs/environment.md`，完成构建 | 能解释四个阶段和当前环境约束 |
 | 第 2 天 | 学阶段一，读 `sgemm_naive.cu` / `sgemm_tiled_smem.cu` / `matrix_ref.hpp`，跑 stage1 correctness | 能解释 naive 与 tiled 的访存差异 |
 | 第 3 天 | 跑 `profile.sh`，看 `nsys`/`ncu` 指标 | 能读懂 SM throughput、memory throughput、occupancy |
-| 第 4 天 | 学阶段二，读 CUTLASS 模板配置，跑 `verify_mma_ptx.sh` 和大矩阵 benchmark | 能解释 Tensor Core 指令和小/大矩阵差异 |
+| 第 4 天 | 学阶段二：先弄清「纯 GEMM、不是融合」，对照 `cutlass_gemm.cu` 与 `fused_gemm_gelu.cu` 的差异；跑 `verify_mma_ptx.sh` 和大矩阵 benchmark | 能指出 epilogue 插槽，并解释 Tensor Core 与小/大矩阵差异 |
 | 第 5 天 | 学阶段三 functor 路径，读 `FastGeluPTX` 和 epilogue op，跑 SFU 验证；再对照 Sm90 visitor 文件与 `verify_sfu_visitor_sm90.sh` | 能解释 functor vs visitor 与 SFU 误差验收 |
 | 第 6 天 | 学阶段四，读 pattern matching 和 external call emission，跑 stage4 test | 能解释 MLIR IR 如何变成外部 fused call |
 | 第 7 天 | 跑端到端 benchmark，整理自己的实验笔记 | 能复述完整 pipeline 和每个验收数据的含义 |
