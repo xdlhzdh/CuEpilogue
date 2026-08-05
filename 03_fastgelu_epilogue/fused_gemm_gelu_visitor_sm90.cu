@@ -48,6 +48,7 @@ using TileShape_MNK = Shape<_128, _128, _64>;
 using ClusterShape_MNK = Shape<_1, _1, _1>;
 
 using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
 using FusionOperation =
     cutlass::epilogue::fusion::LinCombEltAct<FastGelu, ElementD, ElementCompute,
                                              ElementC, ElementScalar>;
@@ -67,7 +68,7 @@ using CollectiveMainloop =
         TileShape_MNK, ClusterShape_MNK,
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
             sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+        MainloopSchedule>::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
