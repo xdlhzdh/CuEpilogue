@@ -130,13 +130,12 @@ LogicalResult emitExternalFusedCall(OpBuilder &builder,
   Value nI64 = arith::IndexCastOp::create(builder, loc, i64Ty, n);
   Value kI64 = arith::IndexCastOp::create(builder, loc, i64Ty, k);
 
-  // The matched matmul carries no explicit alpha/beta scaling attributes at
-  // this IR level, so the fusion represents the common "D = Act(A @ B)"
-  // case: alpha = 1, beta = 0 (no accumulation onto a pre-existing D).
-  Value alpha = arith::ConstantFloatOp::create(builder, loc, builder.getF32Type(),
-                                               llvm::APFloat(1.0f));
-  Value beta = arith::ConstantFloatOp::create(builder, loc, builder.getF32Type(),
-                                              llvm::APFloat(0.0f));
+  // Prefer alpha/beta extracted by the GELU body matcher; they default to
+  // identity (1.0, 0.0) when the generic only encodes Act(A @ B).
+  Value alpha = arith::ConstantFloatOp::create(
+      builder, loc, builder.getF32Type(), llvm::APFloat(match.alpha));
+  Value beta = arith::ConstantFloatOp::create(
+      builder, loc, builder.getF32Type(), llvm::APFloat(match.beta));
 
   Value aCast = castToCanonical(builder, loc, a);
   Value bCast = castToCanonical(builder, loc, b);

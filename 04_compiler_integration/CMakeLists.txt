@@ -31,6 +31,7 @@ add_mlir_library(FusedGemmGeluPasses
   MLIRLinalgDialect
   MLIRMemRefDialect
   MLIRArithDialect
+  MLIRMathDialect
 )
 target_include_directories(FusedGemmGeluPasses PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/lib

@@ -12,7 +12,9 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 FUSED_OPT="${1:-}"
 if [[ -z "$FUSED_OPT" ]]; then
-  for candidate in "$ROOT_DIR"/build*/04_compiler_integration/tools/fused-opt; do
+  for candidate in \
+      "$ROOT_DIR"/build*/04_compiler_integration/fused-opt \
+      "$ROOT_DIR"/build*/04_compiler_integration/tools/fused-opt; do
     if [[ -x "$candidate" ]]; then FUSED_OPT="$candidate"; break; fi
   done
 fi

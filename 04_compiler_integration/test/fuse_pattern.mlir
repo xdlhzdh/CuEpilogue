@@ -13,8 +13,9 @@ func.func @fused_gemm_gelu(%A: tensor<128x128xf32>, %B: tensor<128x128xf32>, %in
     ^bb0(%in: f32, %out: f32):
       // Fast-GELU algebraic approximation (spec 3.3), expressed with plain
       // arith/math ops as a StableHLO/Linalg lowering would emit it. The
-      // fusion pass matches this structurally (elementwise, all-parallel)
-      // without inspecting these ops.
+      // fusion pass matches this structurally *and* inspects the region body
+      // for the Fast-GELU pattern (exp2 + -2.455492); arbitrary elementwise
+      // ops (ReLU, x+1, ...) are rejected.
       %c = arith.constant -2.455492 : f32
       %t = arith.mulf %in, %c : f32
       %e = math.exp2 %t : f32
