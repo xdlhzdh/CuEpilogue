@@ -25,20 +25,8 @@ if [[ -z "$FUSED_OPT" || ! -x "$FUSED_OPT" ]]; then
   exit 1
 fi
 
-INPUT="$SCRIPT_DIR/fuse_pattern.mlir"
+BUFFERIZE_OPTS='bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map'
 OUT="$(mktemp)"
-
-echo "== Running fused-opt: one-shot-bufferize + fuse-gemm-gelu =="
-"$FUSED_OPT" "$INPUT" \
-  --one-shot-bufferize="bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map" \
-  --fuse-gemm-gelu \
-  --canonicalize \
-  > "$OUT"
-
-echo "--- fused-opt output ---"
-cat "$OUT"
-echo "------------------------"
-
 fail=0
 
 check_present() {
@@ -59,10 +47,39 @@ check_absent() {
   fi
 }
 
+run_fuse_case() {
+  local label="$1"
+  local input="$2"
+
+  echo "== Running fused-opt ($label): one-shot-bufferize + fuse-gemm-gelu =="
+  "$FUSED_OPT" "$input" \
+    --one-shot-bufferize="$BUFFERIZE_OPTS" \
+    --fuse-gemm-gelu \
+    --canonicalize \
+    > "$OUT"
+
+  echo "--- fused-opt output ($label) ---"
+  cat "$OUT"
+  echo "---------------------------------"
+}
+
+run_fuse_case "default GELU" "$SCRIPT_DIR/fuse_pattern.mlir"
 check_present "call @cutlass_fused_gemm_gelu"
 check_present "func.func private @cutlass_fused_gemm_gelu"
 check_absent "linalg.matmul"
 check_absent "linalg.generic"
+check_present "1.000000e+00"
+check_present "0.000000e+00"
+
+run_fuse_case "alpha/beta GELU" "$SCRIPT_DIR/fuse_pattern_alpha_beta.mlir"
+check_present "call @cutlass_fused_gemm_gelu"
+check_present "func.func private @cutlass_fused_gemm_gelu"
+check_absent "linalg.matmul"
+check_absent "linalg.generic"
+check_present "2.000000e+00"
+check_present "5.000000e-01"
+
+rm -f "$OUT"
 
 if [[ "$fail" == "0" ]]; then
   echo "ALL STAGE-4 TESTS PASSED"

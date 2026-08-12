@@ -64,12 +64,65 @@ FailureOr<Value> peelStaticAlpha(Value v, Value expectedInput, float &alpha) {
   return failure();
 }
 
+/// True when `v` is `base` (scale = 1) or `arith.mulf(base, cst)` / `mulf(cst, base)`.
+bool matchScaledOperand(Value v, Value base, float &scale) {
+  if (!base)
+    return false;
+  if (v == base) {
+    scale = 1.0f;
+    return true;
+  }
+  if (auto mul = v.getDefiningOp<arith::MulFOp>()) {
+    if (mul.getLhs() == base && matchStaticFloat(mul.getRhs(), scale))
+      return true;
+    if (mul.getRhs() == base && matchStaticFloat(mul.getLhs(), scale))
+      return true;
+  }
+  return false;
+}
+
+/// Recognize `linear` as `alpha * blockInput + beta * blockInit` with static
+/// coefficients (defaults alpha=1, beta=0 when terms are absent).
+bool extractAlphaBetaFromLinear(Value linear, Value blockInput, Value blockInit,
+                                float &alpha, float &beta) {
+  alpha = 1.0f;
+  beta = 0.0f;
+
+  if (matchScaledOperand(linear, blockInput, alpha)) {
+    beta = 0.0f;
+    return true;
+  }
+
+  auto add = linear.getDefiningOp<arith::AddFOp>();
+  if (!add || !blockInit)
+    return false;
+
+  float lhsIn = 1.0f, rhsIn = 1.0f, lhsInit = 1.0f, rhsInit = 1.0f;
+  bool hasLhsIn = matchScaledOperand(add.getLhs(), blockInput, lhsIn);
+  bool hasRhsIn = matchScaledOperand(add.getRhs(), blockInput, rhsIn);
+  bool hasLhsInit = matchScaledOperand(add.getLhs(), blockInit, lhsInit);
+  bool hasRhsInit = matchScaledOperand(add.getRhs(), blockInit, rhsInit);
+
+  if (hasLhsIn && hasRhsInit && !hasLhsInit && !hasRhsIn) {
+    alpha = lhsIn;
+    beta = rhsInit;
+    return true;
+  }
+  if (hasRhsIn && hasLhsInit && !hasRhsInit && !hasLhsIn) {
+    alpha = rhsIn;
+    beta = lhsInit;
+    return true;
+  }
+  return false;
+}
+
 /// Spec 3.3 Fast-GELU algebraic form used by fuse_pattern.mlir:
 ///   GELU(x) ~= x / (1 + 2^(-2.455492 * x))
 /// Recognized as:
 ///   yield(divf(x, addf(exp2(mulf(x, c)), 1)))   with c ≈ -2.455492
-/// where `x` is the (optionally alpha-scaled) block input.
-bool matchFastGeluAlgebraic(Value yielded, Value blockInput, float &alpha) {
+/// where `x` is the linear epilogue value `alpha * in + beta * init`.
+bool matchFastGeluAlgebraic(Value yielded, Value blockInput, Value blockInit,
+                            float &alpha, float &beta) {
   auto div = yielded.getDefiningOp<arith::DivFOp>();
   if (!div)
     return false;
@@ -110,7 +163,7 @@ bool matchFastGeluAlgebraic(Value yielded, Value blockInput, float &alpha) {
   if (numer != x)
     return false;
 
-  return succeeded(peelStaticAlpha(x, blockInput, alpha));
+  return extractAlphaBetaFromLinear(x, blockInput, blockInit, alpha, beta);
 }
 
 /// Classic erf-based GELU: somewhere in the def-use chain of `yielded` there
@@ -283,15 +336,18 @@ bool matchGeluBody(linalg::GenericOp generic, float &alpha, float &beta) {
   Value yielded = yield.getOperand(0);
 
   // Prefer the project's exact Fast-GELU lowering; then erf / tanh / named.
-  bool isGelu =
-      matchFastGeluAlgebraic(yielded, blockInput, alpha) ||
-      matchNamedGeluOp(yielded, blockInput, alpha) ||
-      matchErfBasedGelu(yielded, blockInput, alpha) ||
-      matchTanhBasedGelu(yielded, blockInput, alpha);
+  bool matchedFastGelu =
+      matchFastGeluAlgebraic(yielded, blockInput, blockInit, alpha, beta);
+  bool isGelu = matchedFastGelu || matchNamedGeluOp(yielded, blockInput, alpha) ||
+                matchErfBasedGelu(yielded, blockInput, alpha) ||
+                matchTanhBasedGelu(yielded, blockInput, alpha);
   if (!isGelu)
     return false;
 
-  tryExtractBetaFromAdd(blockInit, beta);
+  // Fast-GELU path already extracted beta from the linear epilogue; erf/tanh
+  // paths may still fold a bare `+ init` term via the legacy beta helper.
+  if (!matchedFastGelu)
+    tryExtractBetaFromAdd(blockInit, beta);
   return true;
 }
 
