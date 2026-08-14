@@ -20,7 +20,7 @@
 | CUDA Toolkit | **12.9.86**，`/usr/local/cuda` 已通过 `update-alternatives` 指向此版本 | 必须是 12.x，见下方说明 |
 | CMake | 4.3.4（`pipx install cmake`） | |
 | Nsight Systems / Compute | `nsys` 2025.1.3；`ncu` 装了两个版本：`2025.2.1`（能用）和 `2026.2.1`（与 535 驱动不兼容，见下） | `ncu` 还需要 `sudo`，见下 |
-| LLVM / MLIR | 23.0.0git，`mlir-opt` / `llvm-config` / `MLIRConfig.cmake` 均在 `/usr/local` | 阶段四依赖 |
+| LLVM / MLIR | 23.0.0git，`mlir-opt` / `llvm-config` / `MLIRConfig.cmake` 均在 `/usr/local` | 阶段四、五依赖 |
 | CUTLASS | v3.5.1，CMake `FetchContent` 自动拉取 | |
 
 ### 为什么编译必须用 CUDA 12.x
@@ -68,6 +68,6 @@ spec 建议 Ampere 及以上架构，但本项目实际目标硬件是 Volta，�
 项目最初在**没有 GPU 访问权限**的 WSL2 沙盒中搭建（Ubuntu 26.04, CUDA 12.4.131, LLVM/MLIR 23.0.0git）。该环境下：
 
 - 阶段一～三：仅完成编译 + 静态 PTX/SASS 指令验证，正确性测试和 Profile 因无 GPU 无法运行。
-- 阶段四（MLIR，不需要 GPU）：曾在沙盒内完整验证。
+- 阶段四、五（MLIR，不需要 GPU 即可跑 IR 测试）：曾在沙盒内完整验证阶段四；阶段五同样只依赖 `qdq-opt`。
 
-当前 Linux Mint 宿主机已具备完整的 GPU + MLIR 环境，四个阶段的构建、正确性测试与静态验证均已在本机跑通（`ctest` 4/4 通过）。阶段一 profile、阶段二吞吐量对比、阶段三 SFU 指令/误差验证、阶段四端到端延迟数据也已产出，详见 README「验收结果总览」。`ncu --set full` 采集需要使用兼容版本（本机为 `2025.2.1`）并以 `sudo` 运行；`01_baseline_cuda/profile.sh` 已自动处理这两点。
+当前 Linux Mint 宿主机已具备完整的 GPU + MLIR 环境。阶段一～四的构建、正确性测试与静态验证均已在本机跑通；阶段五增加 QDQ tensor 融合与 INT8 kernel。详见 README「验收结果总览」。

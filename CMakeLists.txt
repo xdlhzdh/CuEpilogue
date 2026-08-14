@@ -10,7 +10,7 @@ set(CMAKE_CUDA_ARCHITECTURES ${CU_EPILOGUE_CUDA_ARCH})
 project(CuEpilogue LANGUAGES C CXX)
 
 option(CU_EPILOGUE_ENABLE_CUDA "Enable CUDA stages (1-3): requires nvcc" ON)
-option(CU_EPILOGUE_ENABLE_MLIR "Enable MLIR compiler-integration stage (4): requires LLVM/MLIR" ON)
+option(CU_EPILOGUE_ENABLE_MLIR "Enable MLIR stages (4-5): requires LLVM/MLIR" ON)
 option(CU_EPILOGUE_BUILD_TESTS "Build correctness / verification tests" ON)
 # Side-by-side CUTLASS 3.x Sm90 EVT / FusionCallbacks Fast-GELU path (stage 3).
 # Compiles that target for sm_90a regardless of CU_EPILOGUE_CUDA_ARCH; device
@@ -33,7 +33,7 @@ endif()
 
 message(STATUS "CuEpilogue: target CUDA arch = sm_${CU_EPILOGUE_CUDA_ARCH}")
 message(STATUS "CuEpilogue: CUDA stages enabled = ${CU_EPILOGUE_ENABLE_CUDA}")
-message(STATUS "CuEpilogue: MLIR stage enabled  = ${CU_EPILOGUE_ENABLE_MLIR}")
+message(STATUS "CuEpilogue: MLIR stages enabled = ${CU_EPILOGUE_ENABLE_MLIR}")
 message(STATUS "CuEpilogue: Sm90 visitor path   = ${CU_EPILOGUE_ENABLE_SM90_VISITOR}")
 
 if(CU_EPILOGUE_ENABLE_CUDA)
@@ -62,4 +62,5 @@ endif()
 
 if(CU_EPILOGUE_ENABLE_MLIR)
   add_subdirectory(04_compiler_integration)
+  add_subdirectory(05_qdq_fusion)
 endif()

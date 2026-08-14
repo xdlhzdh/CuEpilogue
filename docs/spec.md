@@ -76,6 +76,18 @@ struct FastGeluPTX {
   - **代码生成 (Code Emission):** 拦截常规的 Lowering 管道（即不将其逐步 Lower 到 LLVM IR 的基础标量指令），在 Bufferization 分配好内存句柄后，直接 Emit 外部函数调用 (External Call) 指向该定制的 Fused Operator。
 - **验收标准:** 编译器前端输入 Fused GEMM + GELU 的计算图，能够成功编译并执行，端到端延迟对比基础指令展开下降 30% 以上。
 
+### 阶段五：QDQ 算子融合（Tensor 高阶 Op → OSB → func.call）
+
+- **目标:** 在 Linalg-on-Tensor 上把整条量化链融合为单一 DPS 高阶 Op，避免 One-Shot Bufferize 为 DQ / Matmul / Bias / GELU / Q 的中间张量分配显存；阶段四（memref 上的 FP32 GEMM+GELU）保持不动。
+- **量化语义:** 每张量 INT8 affine：`x_f32 = (x_i8 - zp) * scale`，输出 `y_i8 = clamp(round(y_f32 / scale_d + zp_d), -128, 127)`。融合后：`D = Q(FastGELU((DQ(A) @ DQ(B)) + bias))`。A/B 的 zero-point 校正在 C ABI 内部完成（INT32 累加后用行/列和做 affine 修正），不把 sum 张量暴露到 MLIR。
+- **实现细节:**
+  - **高阶 Op:** 方言 `cutlass`，DPS op `cutlass.qgemm_bias_gelu`（`DestinationStyleOpInterface` + `BufferizableOpInterface`）。Tensor 形态有一个与 `D` 绑定的 result；memref 形态无 result，原地写 `D`。
+  - **Tensor 匹配:** pass `-fuse-qdq-qgemm-bias-gelu` 在 bufferize 之前匹配 DQ generic、`linalg.matmul`、bias 广播 generic、Fast-GELU（`exp2` + `-2.455492`）、Q generic；整条链单消费者。
+  - **OSB:** `--one-shot-bufferize="bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map"`。图上只剩高阶 Op 时，不应再出现 `linalg.matmul` / GELU / DQ-Q generic。
+  - **Lowering:** `-lower-cutlass-qgemm-to-call` 插入 private 声明并替换为 `func.call @cutlass_qgemm_bias_gelu`。
+  - **Kernel:** CUTLASS INT8 GEMM（Volta 无 INT8 Tensor Core，故用 SIMT `int8`×`int8`→`int32`；Turing+ 才有 `mma.sync.aligned.m8n8k16`）+ affine zp + bias + 同一套 `FastGeluPTX` + quantize；封装为 `libcutlass_qgemm_bias_gelu_runtime.so`。
+- **验收标准:** `qdq-opt` 三段 IR：fuse 后出现 `cutlass.qgemm_bias_gelu` 且无 `linalg.matmul`；OSB 后 operand 为 memref；lower 后为 `call @cutlass_qgemm_bias_gelu`。GPU 上 kernel 与 CPU affine 参考一致；无 GPU 时 IR 测试仍可跑。
+
 ## 4. 关键技术风险与排查路径 (Risk Mitigation)
 
 1. **寄存器溢出 (Register Spilling):**

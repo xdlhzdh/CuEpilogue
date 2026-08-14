@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Configures and builds the entire project (all 4 stages), then runs every
+# Configures and builds the entire project (all 5 stages), then runs every
 # static verification script plus `ctest`. On a machine without a live GPU
-# (see docs/environment.md) the stage 1-3 ctest entries are *expected* to
+# (see docs/environment.md) the CUDA ctest entries are *expected* to
 # fail at runtime with a CUDA driver/device error - the build and the
-# static PTX/SASS checks are what matter there. On a real GPU machine all
-# four ctest entries should pass.
+# static PTX/SASS checks are what matter there. On a real GPU machine CUDA
+# tests plus stage-4/5 IR tests should pass.
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,5 +31,9 @@ echo "== Stage 4: fusion pass test (runs fully in any environment, no GPU needed
 ./04_compiler_integration/test/run_tests.sh build/04_compiler_integration/fused-opt
 
 echo
-echo "== ctest (stage 1-3 correctness tests need a real GPU to pass; see docs/environment.md) =="
+echo "== Stage 5: QDQ tensor fusion (IR only, no GPU needed) =="
+./05_qdq_fusion/test/run_tests.sh build/05_qdq_fusion/qdq-opt
+
+echo
+echo "== ctest (stage 1-3 and stage5 kernel tests need a real GPU to pass; see docs/environment.md) =="
 (cd build && ctest --output-on-failure)

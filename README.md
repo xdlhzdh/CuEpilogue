@@ -4,14 +4,15 @@ Fused GEMM + Epilogue (Fast-GELU) 自定义算子开发与编译器集成 ——
 
 ## 项目主线
 
-本项目按四个阶段递进：先用手写 CUDA SGEMM 建立基线，再用 CUTLASS Tensor Core GEMM 提升吞吐，随后把 Fast-GELU 注入 CUTLASS Epilogue，最后用 MLIR pass 把 `linalg.matmul + linalg.generic` 改写成对外部 CUTLASS fused kernel 的调用。
+本项目按五个阶段递进：先用手写 CUDA SGEMM 建立基线，再用 CUTLASS Tensor Core GEMM 提升吞吐，随后把 Fast-GELU 注入 CUTLASS Epilogue，再用 MLIR pass 把 memref 上的 `linalg.matmul + linalg.generic` 改写成对外部 CUTLASS fused kernel 的调用，最后在 **Linalg-on-Tensor** 上把 DQ + Matmul + Bias + GELU + Q 收成高阶 Op，经 One-Shot Bufferize 后 lower 成 INT8 fused kernel 调用。
 
 | 阶段 | 目录 | 内容 |
 | --- | --- | --- |
 | 1 | `01_baseline_cuda/` | Native CUDA SGEMM：无 tiling 版本 + Shared Memory tiling 版本，作为性能/精度基准 |
 | 2 | `02_cutlass_gemm/` | CUTLASS GEMM：FP16 输入 / FP32 累加，配置 Threadblock/Warp/Instruction Shape 触发 Tensor Core `mma.sync.aligned` |
 | 3 | `03_fastgelu_epilogue/` | Inline PTX Fast-GELU：functor（Sm70 `device::Gemm`）与 Sm90 visitor（`CollectiveBuilder` + `LinCombEltAct`）并存；阶段四默认走 functor |
-| 4 | `04_compiler_integration/` | MLIR 编译器后端集成：`fused-opt` 在 Bufferization 后把 `linalg.matmul`+`linalg.generic` 替换为对外部 CUTLASS 算子 `.so` 的 `call` |
+| 4 | `04_compiler_integration/` | MLIR 编译器后端集成：`fused-opt` 在 Bufferization 后把 `linalg.matmul`+`linalg.generic` 替换为对外部 CUTLASS 算子 `.so` 的 `call`（FP32 GEMM+GELU） |
+| 5 | `05_qdq_fusion/` | QDQ 整图融合：tensor 上匹配 DQ+Matmul+Bias+Fast-GELU+Q，插入 `cutlass.qgemm_bias_gelu`，OSB 后 lower 为 INT8 fused kernel 调用 |
 
 四个阶段依次递进，均已实现；每个阶段的目的、运行方法和验收结果见下文「验收结果总览」。
 
@@ -26,6 +27,7 @@ CuEpilogue/
 ├── 02_cutlass_gemm/                  # 阶段二：CUTLASS GEMM + 大矩阵吞吐 benchmark
 ├── 03_fastgelu_epilogue/              # 阶段三：Inline PTX Fast-GELU
 ├── 04_compiler_integration/            # 阶段四：MLIR 编译器集成 + 端到端延迟 benchmark
+├── 05_qdq_fusion/                      # 阶段五：QDQ tensor 融合 + INT8 fused kernel
 ├── scripts/setup_env.sh              # 安装 CUDA Toolkit
 ├── scripts/build_all.sh              # 一键配置+编译+功能验证
 └── docs/
@@ -42,7 +44,7 @@ sudo apt-get install -y cuda-toolkit-12-9   # V100 (sm_70) 需要 CUDA 12.x
 sudo update-alternatives --config cuda      # 确保默认 nvcc 指向 12.9
 ```
 
-阶段四需要 LLVM/MLIR（`find_package(MLIR CONFIG)` 能找到 `MLIRConfig.cmake`）；未安装时构建加 `-DCU_EPILOGUE_ENABLE_MLIR=OFF`。CMake 缺失可用 `pipx install cmake`。版本选择的原因见 [docs/environment.md](docs/environment.md)。
+阶段四、五需要 LLVM/MLIR（`find_package(MLIR CONFIG)` 能找到 `MLIRConfig.cmake`）；未安装时构建加 `-DCU_EPILOGUE_ENABLE_MLIR=OFF`。CMake 缺失可用 `pipx install cmake`。版本选择的原因见 [docs/environment.md](docs/environment.md)。
 
 ### 2. 配置与编译
 
@@ -58,7 +60,7 @@ cmake --build build -j$(nproc)
 | `CU_EPILOGUE_CUDA_ARCH` | `70` | 目标 SM 架构（70/80/86/89/90...）；作用于阶段一～三 functor 路径 |
 | `CU_EPILOGUE_ENABLE_CUDA` | `ON` | 是否构建阶段一~三（需要 `nvcc`，找不到会自动关闭并给出警告） |
 | `CU_EPILOGUE_ENABLE_SM90_VISITOR` | `ON` | 是否构建阶段三 Sm90 visitor 旁路（单独编 `sm_90a`；设备 correctness 需 Hopper） |
-| `CU_EPILOGUE_ENABLE_MLIR` | `ON` | 是否构建阶段四（需要 `find_package(MLIR)` 成功） |
+| `CU_EPILOGUE_ENABLE_MLIR` | `ON` | 是否构建阶段四、五（需要 `find_package(MLIR)` 成功） |
 | `CU_EPILOGUE_BUILD_TESTS` | `ON` | 是否注册 `ctest` 测试 |
 
 ### 3. 一键跑完编译 + 功能验证
@@ -67,11 +69,11 @@ cmake --build build -j$(nproc)
 ./scripts/build_all.sh
 ```
 
-等价于依次执行下方「验收结果总览」里的 `ctest`、静态验证脚本和阶段四 fusion pass 测试。`ncu` / `nsys` profile、大矩阵吞吐和端到端延迟 benchmark 耗时更长，需要单独运行。
+等价于依次执行下方「验收结果总览」里的 `ctest`、静态验证脚本和阶段四/五 fusion pass 测试。`ncu` / `nsys` profile、大矩阵吞吐和端到端延迟 benchmark 耗时更长，需要单独运行。
 
 ## 验收结果总览
 
-下面按阶段列出验收项。阶段一、二、四侧重正确性 + 性能；阶段三侧重**把 Fast-GELU 融进 CUTLASS 矩阵乘、确认走了 SFU 硬件指令、数值误差在 spec 允许范围内**——它不是「再跑一遍吞吐 benchmark」，融合带来的延迟收益在阶段四体现。
+下面按阶段列出验收项。阶段一、二、四侧重正确性 + 性能；阶段三侧重**把 Fast-GELU 融进 CUTLASS 矩阵乘、确认走了 SFU 硬件指令、数值误差在 spec 允许范围内**——它不是「再跑一遍吞吐 benchmark」，融合带来的延迟收益在阶段四体现。阶段五把量化图的融合提前到 tensor IR，避免 OSB 为 DQ/GELU/Q 中间结果分配显存。
 
 | 阶段 | 阶段目的 | 验收方法 | 当前结果 |
 | --- | --- | --- | --- |
@@ -79,8 +81,15 @@ cmake --build build -j$(nproc)
 | 2. CUTLASS Tensor Core GEMM | 用 CUTLASS FP16 Tensor Core GEMM 替代阶段一手写 FP32 kernel，并验证吞吐显著提升 | `cd build && ctest -R stage2_correctness_test --output-on-failure`；`./02_cutlass_gemm/verify_mma_ptx.sh`；`./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096` | `ctest` 通过；PTX 含 `mma.sync.aligned.m8n8k4`；4096³ 下阶段一 **3.05 TFLOPS**、阶段二 **36.27 TFLOPS**，**11.9× 加速** |
 | 3. Fast-GELU Epilogue | 把 Fast-GELU 融合进 CUTLASS Epilogue，GEMM 输出在寄存器路径中完成激活，避免中间张量落显存 | Functor：`ctest -R stage3_correctness_test`；`./03_fastgelu_epilogue/verify_sfu_sass.sh`。Visitor：`./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh`；`ctest -R stage3_visitor`（cc&lt;90 时 SKIP） | Functor：`ctest` 通过；PTX/SASS 含 SFU。Visitor：`sm_90a` 下 PTX 含 `ex2.approx`/`rcp.approx`，SASS 含 `MUFU.EX2`/`MUFU.RCP`；V100 上 correctness SKIP |
 | 4. MLIR compiler integration | 在 MLIR 后端识别 `linalg.matmul + linalg.generic`，改写为对外部 fused CUTLASS kernel 的调用 | `cd build && ctest -R stage4 --output-on-failure`；`./04_compiler_integration/benchmark_e2e.sh` | fusion pass 测试通过；20 次 fused 调用 **0.68ms**，未融合标量 CPU 循环 **148.3ms**，端到端延迟下降 **99.5%** |
+| 5. QDQ tensor fusion | 在 Linalg-on-Tensor 上融合 DQ+Matmul+Bias+Fast-GELU+Q 为 `cutlass.qgemm_bias_gelu`，OSB 后 lower 成 INT8 kernel 调用 | `cd build && ctest -R stage5 --output-on-failure` | IR 三段（fuse / OSB / func.call）通过；GPU 上 INT8 kernel 与 CPU affine 参考一致 |
 
-`ctest` 汇总：`cd build && ctest --output-on-failure` 当前 4/4 通过。
+`ctest` 汇总：`cd build && ctest --output-on-failure`（含阶段五 IR + GPU kernel）。
+
+### 阶段五：为什么不在 memref 上做 QDQ 融合？
+
+阶段四在 **bufferize 之后**才匹配 GEMM+GELU，中间 f32 张量已经变成 `memref.alloc`。若 DQ/Q 也走同一路径，OSB 会为 `A_f32`、`acc`、`gelu` 等中间结果分配显存，量化图的意义就没了。
+
+阶段五在 tensor 上先收成 DPS 高阶 Op `cutlass.qgemm_bias_gelu`：OSB 只 bufferize 已有的 `ins/outs`（INT8 A/B/D 和 f32 bias），再 `-lower-cutlass-qgemm-to-call` 变成 `func.call @cutlass_qgemm_bias_gelu`。量化是每张量 INT8 affine（`scale` + `zero-point`）；zero-point 修正留在 C ABI 内部，不把 row/col sum 暴露到 MLIR。Volta 没有 INT8 Tensor Core，kernel 用 CUTLASS SIMT INT8 GEMM + Fast-GELU epilogue。阶段四仍是 FP32 GEMM+GELU，保持不动。
 
 ### 阶段二：为什么 `ctest` 里阶段二看起来反而更慢？
 
@@ -141,6 +150,7 @@ cmake --build build -j$(nproc)
 - **阶段二：换成 CUTLASS + Tensor Core**（`02_cutlass_gemm/cutlass_gemm.cu`）：不再手写乘加循环，改用 NVIDIA 的 CUTLASS 库，让 V100 的 Tensor Core 干矩阵乘（编译后能看到 `mma.sync.aligned.m8n8k4` 指令）。输入矩阵用 FP16 省带宽，累加和输出仍用 FP32 保精度。一次处理 128×128 的子块（`ThreadblockShape<128,128,32>`）；Volta 没有 `cp.async`，流水线只能做 2 级，没法像新卡那样叠很多层预取。阶段三在**同一套矩阵乘配置**上，只改「乘完之后干什么」。
 - **阶段三：乘完立刻算 GELU，不落显存**（`03_fastgelu_epilogue/`）：普通做法是 GEMM 先把结果写回显存，再另起一个 kernel 做 GELU。这里把 GELU 塞进 CUTLASS 的 epilogue——矩阵乘累加完成后，在寄存器里直接做 `α·acc + β·C`，紧接着用 `FastGeluPTX`（`fast_gelu_ptx.cuh`）算 GELU，全程不经过中间张量。GELU 走 GPU 的 SFU 近似指令（`ex2.approx` / `rcp.approx`），`fast_gelu_epilogue_op.cuh` 把它包装成 CUTLASS 能识别的 epilogue 接口，替换原来的线性组合输出。
 - **阶段四：编译器认出「矩阵乘 + GELU」并合成一次调用**（`04_compiler_integration/`）：`FuseGemmGeluPattern.cpp` 在 MLIR 里找这样的模式——`linalg.matmul` 的输出**只**被一个逐元素激活（GELU）消费，且两者已经 bufferize 成内存上的张量。匹配成功就把两个算子删掉，改成调用外部函数 `@cutlass_fused_gemm_gelu`。`EmitExternalCall.cpp` 在生成调用前检查张量是不是 2D、是不是 f32、布局对不对，不对就直接报错，避免生成错误的 C 接口。`runtime/cutlass_fused_gemm_gelu_c_api.cu` 把阶段三的 kernel 包成这个外部函数，打进 `libcutlass_fused_gemm_gelu_runtime.so`，供 MLIR 生成的代码链接调用。
+- **阶段五：量化图在 tensor 上整段融合**（`05_qdq_fusion/`）：`-fuse-qdq-qgemm-bias-gelu` 匹配 DQ + `linalg.matmul` + bias + Fast-GELU + Q，插入 `cutlass.qgemm_bias_gelu`；One-Shot Bufferize 把它变成 memref 黑盒；`-lower-cutlass-qgemm-to-call` 发出 `@cutlass_qgemm_bias_gelu`。INT8 kernel 与 C ABI 在 `kernels/` 和 `runtime/`。
 
 ## 关键风险与当前状态（对应 spec 第 4 节）
 
@@ -150,5 +160,5 @@ cmake --build build -j$(nproc)
 | --- | --- | --- | --- |
 | 寄存器溢出 | CUTLASS tile 或 epilogue 过大时，线程寄存器不够用，编译器会把数据溢出到 local memory，kernel 变慢、occupancy 下降 | **已验证，当前无溢出** | `verify_mma_ptx.sh` / `verify_sfu_sass.sh` 统计 PTX 中 `ld.local` / `st.local`；当前配置下均为 **0**。若以后改 tile 配置，需重跑这两个脚本 |
 | 访存合并失败 | Epilogue 写回 global memory 时未形成高效向量化访问，带宽利用变差 | **核心指标已验证，细分项可继续深入** | 阶段一/二已有 `ncu` 核心吞吐数据；若继续定位，可看 `l1tex__data_bank_conflicts`、global load/store transaction，以及 SASS 中 `LDG.128` / `STG.128` |
-| IR 语义不对齐 | MLIR 侧 memref 的 rank、dtype、stride/layout 与底层 CUTLASS C API 不一致，可能生成错误外部调用 | **已有编译期防护** | `EmitExternalCall.cpp::validateOperand()` 要求 rank==2、f32、identity layout；不满足则 pass 直接报错，不会静默生成错误 ABI |
+| IR 语义不对齐 | MLIR 侧 memref 的 rank、dtype、stride/layout 与底层 CUTLASS C API 不一致，可能生成错误外部调用 | **已有编译期防护** | 阶段四 `EmitExternalCall.cpp::validateOperand()`；阶段五 `LowerToCall.cpp` 要求 A/B/D 为 rank-2 identity `i8` memref、bias 为 rank-1 identity `f32` |
 | 动态形状 memref JIT 调用 | MLIR bare-pointer 约定下，动态形状 memref 难以直接 JIT 调用外部 fused kernel | **已在 benchmark 设计中规避** | 阶段四 fused 性能侧用 `bench_fused_e2e` 直接调 C++ kernel；fusion pass 行为由 `stage4_fuse_gemm_gelu_test` 单独覆盖 |
