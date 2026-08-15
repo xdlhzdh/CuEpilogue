@@ -10,30 +10,34 @@ AI 推理里常见的计算形态是：
 D = GELU(A @ B)
 ```
 
-如果普通 lowering 把 GEMM 和 GELU 拆成两个 kernel，中间矩阵会先写回显存，再被 GELU kernel 读回来。这个项目的目标是把 GEMM 和 Fast-GELU 融合成一个高性能 CUDA/CUTLASS kernel，并让 MLIR 后端在识别到 `linalg.matmul + linalg.generic` 时直接发出外部 fused kernel 调用。
+如果普通 lowering 把 GEMM 和 GELU 拆成两个 kernel，中间矩阵会先写回显存，再被 GELU kernel 读回来。这个项目的目标是把 GEMM 和 Fast-GELU 融合成一个 CUDA/CUTLASS kernel，并让 MLIR 认出 `linalg.matmul + linalg.generic` 后直接调用这个 kernel。
 
 整体路线：
 
 ```text
-Native CUDA baseline
+手写 CUDA SGEMM
   -> CUTLASS Tensor Core GEMM
-  -> CUTLASS Epilogue 注入 Fast-GELU
-  -> MLIR pass 发出 FP32 fused call（memref 之后）
-  -> QDQ 在 tensor 上整图融合，OSB 后发出 INT8 fused call
+  -> 把 Fast-GELU 塞进 GEMM 的 epilogue
+  -> MLIR 在 memref 上把 FP32 GEMM+GELU 收成一次外部调用（阶段四）
+  -> MLIR 在 tensor 上把量化图收成一次 INT8 外部调用（阶段五）
 ```
 
 ## 2. 先看懂目录
 
-| 路径 | 重点 |
-| --- | --- |
-| `common/` | CUDA error check、CPU reference GEMM、随机输入、误差统计 |
-| `01_baseline_cuda/` | 手写 naive SGEMM 和 shared-memory tiled SGEMM；建立 profile 基线 |
-| `02_cutlass_gemm/` | CUTLASS Tensor Core **纯 GEMM** 基座（尚未融合 GELU）；`mma.sync` 验证与大矩阵吞吐 benchmark |
-| `03_fastgelu_epilogue/` | Fast-GELU inline PTX；functor epilogue（Sm70）与 Sm90 visitor（`LinCombEltAct` / EVT）；SFU 指令验证 |
-| `04_compiler_integration/` | MLIR pass、external call emission、runtime C ABI、端到端 benchmark（FP32 GEMM+GELU） |
-| `05_qdq_fusion/` | `cutlass.qgemm_bias_gelu` 方言、tensor 匹配、OSB、INT8 kernel 与 C ABI |
-| `scripts/` | 一键构建和功能验证 |
-| `docs/` | spec、环境说明和本学习手册 |
+
+| 路径                         | 重点                                                                                        |
+| -------------------------- | ----------------------------------------------------------------------------------------- |
+| `common/`                  | CUDA error check、CPU reference GEMM、随机输入、误差统计                                             |
+| `01_baseline_cuda/`        | 手写 naive SGEMM 和 shared-memory tiled SGEMM；建立 profile 基线                                  |
+| `02_cutlass_gemm/`         | CUTLASS Tensor Core **纯 GEMM** 基座（尚未融合 GELU）；`mma.sync` 验证与大矩阵吞吐 benchmark                |
+| `03_fastgelu_epilogue/`    | Fast-GELU inline PTX；functor epilogue（Sm70）与 Sm90 visitor（`LinCombEltAct` / EVT）；SFU 指令验证 |
+| `04_compiler_integration/` | 阶段四：在 memref 上匹配 GEMM+GELU，改成调用 `.so` |
+| `05_qdq_fusion/`           | 阶段五：在 tensor 上匹配量化图，bufferize 后再调用 INT8 kernel |
+| `scripts/`                 | 一键构建和功能验证                                                                                 |
+| `docs/`                    | spec、环境说明和本学习手册                                                                           |
+
+
+
 
 ## 3. 阶段一：CUDA SGEMM Baseline
 
@@ -99,7 +103,11 @@ cd .. && ./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness
 - shared memory tiling 如何把 A/B 的重复读取摊薄。
 - `nsys` 看时间线，`ncu` 看 SM throughput、memory throughput、occupancy。
 
+
+
 ## 4. 阶段二：CUTLASS Tensor Core GEMM
+
+
 
 ### 4.1 这个目录到底在做什么
 
@@ -111,16 +119,18 @@ D = alpha * (A @ B) + beta * C
 
 没有 GELU，也没有第二个激活 kernel。目录里的工作可以拆成四块：
 
-| 文件 | 作用 |
-| --- | --- |
-| `cutlass_gemm.cu` / `.cuh` | 配置 `device::Gemm`（Sm70、FP16 输入、FP32 累加），封装 `CutlassGemmFp16` 启动入口 |
-| `correctness_test.cu` | 小矩阵上对比 CPU reference（A/B 先量化到 FP16） |
-| `verify_mma_ptx.sh` | 离线编译 PTX，确认出现 `mma.sync.aligned.m8n8k4`（不依赖 GPU 运行） |
-| `bench_throughput_large.cu` | 大矩阵计时，对比阶段一 tiled SGEMM 的 TFLOPS |
+
+| 文件                          | 作用                                                                |
+| --------------------------- | ----------------------------------------------------------------- |
+| `cutlass_gemm.cu` / `.cuh`  | 配置 `device::Gemm`（Sm70、FP16 输入、FP32 累加），封装 `CutlassGemmFp16` 启动入口 |
+| `correctness_test.cu`       | 小矩阵上对比 CPU reference（A/B 先量化到 FP16）                               |
+| `verify_mma_ptx.sh`         | 离线编译 PTX，确认出现 `mma.sync.aligned.m8n8k4`（不依赖 GPU 运行）               |
+| `bench_throughput_large.cu` | 大矩阵计时，对比阶段一 tiled SGEMM 的 TFLOPS                                  |
+
 
 `CutlassGemmFp16` 这个函数的调用流程分三步：
 
-1. **对外接口仍是 FP32**：`CutlassGemmFp16(M, N, K, alpha, A_fp32, B_fp32, beta, C_fp32, ...)` 的入参和阶段一的 SGEMM 函数长得一样，全是 `float*`。
+1. **对外接口仍是 FP32**：`CutlassGemmFp16(M, N, K, alpha, A_fp32, B_fp32, beta, C_fp32, ...)` 的入参和阶段一的 SGEMM 函数长得一样，全是 `float`*。
 2. **内部先做一次 FP32 → FP16 的类型转换**：函数一开始会在 GPU 上额外跑一个小 kernel（`ConvertF32ToF16Kernel`），把 A、B 从 FP32 转成 FP16，存进两块新分配的临时显存里。真正喂给 CUTLASS Tensor Core 的是这两块 FP16 数据，C 全程仍是 FP32（Tensor Core 用 FP16 相乘、FP32 累加）。
 3. **调用 CUTLASS**：用转换后的 FP16 A/B 和原来的 FP32 C 构造 `Arguments`，依次调 `can_implement`（检查这个问题规模/类型合不合法）→ `initialize`（分配 workspace、绑定参数）→ `operator()`（真正跑 kernel），结果写回同一块 FP32 C。
 
@@ -178,10 +188,12 @@ using CutlassGemmSm70 = cutlass::gemm::device::Gemm<
 # speedup: 11.9x
 ```
 
+
+
 ### 4.4 建议学习顺序
 
 1. **先建立定位**：明确本目录输出是纯 GEMM，不是 fused GELU；对照打开 `03_fastgelu_epilogue/fused_gemm_gelu.cu`，看哪些 typedef 一字不差、哪里只换成了 `FastGeluEpilogueOp`。
-2. **读 `cutlass_gemm.cu`**：搞清 `ElementA/B=half_t`、`ElementAccumulator=float`、`OpClassTensorOp`、`Sm70`、`kStages=2`（Volta 无 `cp.async`）各自约束什么。
+2. **读** `cutlass_gemm.cu`：搞清 `ElementA/B=half_t`、`ElementAccumulator=float`、`OpClassTensorOp`、`Sm70`、`kStages=2`（Volta 无 `cp.async`）各自约束什么。
 3. **认 epilogue 插槽**：盯住模板参数里的 `LinearCombination`——阶段三要替换的就是它；此时它只做线性组合。
 4. **跑正确性**：`cd build && ctest -R stage2_correctness_test --output-on-failure`，理解为何 reference 要 FP16 预量化、为何 tolerance 比阶段一松。
 5. **静态指令验收**：`./02_cutlass_gemm/verify_mma_ptx.sh`，确认 PTX 里有 `mma.sync.aligned.m8n8k4`（不要求 GPU 运行）。
@@ -194,6 +206,8 @@ using CutlassGemmSm70 = cutlass::gemm::device::Gemm<
 - `ThreadblockShape` / `WarpShape` / `InstructionShape` 如何落到 `mma.sync.aligned.m8n8k4`。
 - 为什么 correctness 用小矩阵、performance 必须用大矩阵。
 
+
+
 ## 5. 阶段三：Fast-GELU Epilogue
 
 阶段三把激活函数融合进 CUTLASS Epilogue。目标不是再启动一个 GELU kernel，而是在 GEMM accumulator 输出时直接完成：
@@ -204,14 +218,16 @@ D = FastGELU(alpha * accumulator + beta * source)
 
 同一套 Inline PTX Fast-GELU（`FastGeluPTX`）有两条并存注入路径：
 
-| 路径 | API | 编译目标架构 | 是否默认路径 | 阶段四会用它吗 |
-| --- | --- | --- | --- | --- |
-| **Functor**（2.x 风格） | `device::Gemm` + `FastGeluLinearCombination` | Sm70（跟随 `CU_EPILOGUE_CUDA_ARCH`，默认 70） | 是 | 会 |
-| **Visitor / EVT**（3.x） | `CollectiveBuilder` + `fusion::LinCombEltAct<FastGelu>` | Hopper，编译时需用 `sm_90a` | 否，是旁路（`CU_EPILOGUE_ENABLE_SM90_VISITOR` 默认开着，但只表示「默认会被编译」，不代表它是主线路径） | 不会 |
+
+| 路径                     | API                                                     | 编译目标架构                                 | 是否默认路径                                                               | 阶段四会用它吗 |
+| ---------------------- | ------------------------------------------------------- | -------------------------------------- | -------------------------------------------------------------------- | ------- |
+| **Functor**（2.x 风格）    | `device::Gemm` + `FastGeluLinearCombination`            | Sm70（跟随 `CU_EPILOGUE_CUDA_ARCH`，默认 70） | 是                                                                    | 会       |
+| **Visitor / EVT**（3.x） | `CollectiveBuilder` + `fusion::LinCombEltAct<FastGelu>` | Hopper，编译时需用 `sm_90a`                  | 否，是旁路（`CU_EPILOGUE_ENABLE_SM90_VISITOR` 默认开着，但只表示「默认会被编译」，不代表它是主线路径） | 不会      |
+
 
 说明：仓库通过 CMake 拉取的是 CUTLASS **v3.5.1**，但 functor 路径用的是其中兼容 2.x 的 `cutlass::gemm::device::Gemm` API，并不是 3.x 的新接口。
 
-真正的 3.x visitor（`FusionCallbacks` / `Sm90EVT`）目前只有 Hopper 架构才完整支持。编译 visitor 目标时，nvcc 的目标架构必须写成 **`sm_90a`**（注意末尾的 `a`），不能只写 `sm_90`——否则编译器只会生成一个 `printf` 报错的空壳 kernel，不会真正执行任何 WGMMA 计算。
+真正的 3.x visitor（`FusionCallbacks` / `Sm90EVT`）目前只有 Hopper 架构才完整支持。编译 visitor 目标时，nvcc 的目标架构必须写成 `sm_90a`（注意末尾的 `a`），不能只写 `sm_90`——否则编译器只会生成一个 `printf` 报错的空壳 kernel，不会真正执行任何 WGMMA 计算。
 
 ### 5.1 Functor 路径（默认）
 
@@ -260,6 +276,8 @@ cd build && ctest -R stage3_correctness_test --output-on-failure
 cd .. && ./03_fastgelu_epilogue/verify_sfu_sass.sh
 ```
 
+
+
 ### 5.2 Visitor 路径（Sm90 EVT 旁路）
 
 重点文件：
@@ -300,6 +318,8 @@ cd build && ctest -R stage3_visitor_correctness_test --output-on-failure
 - 为什么要用 SFU 近似指令，而不是普通 `expf` 展开。
 - 数值验收为什么看绝对误差和 SFU 额外误差，而不是只看相对误差。
 - Functor（替换 `LinearCombination`）与 Visitor（`LinCombEltAct` → EVT 树）的接口差异，以及为何 3.x visitor 绑定 Hopper `sm_90a`。
+
+
 
 ## 6. 阶段四：MLIR 编译器集成
 
@@ -353,36 +373,99 @@ cd .. && ./04_compiler_integration/benchmark_e2e.sh
 
 学习重点：
 
-- 为什么 pass 要在 bufferization 后匹配 memref-based `linalg.matmul`。
-- 为什么 matmul 的输出只能被一个 activation 算子消费（即只能接一个下游 consumer）。
-- 为什么 external call 前必须做 rank/type/layout 校验。
-- 为什么当前 benchmark fused 侧直接调用 C++ 可执行文件，而 fusion 行为由单独的 pass test 覆盖。
+- 为什么 pass 要等 tensor 变成 memref 再匹配：后面要调的是 C 函数，入参是指针。
+- 为什么 matmul 的输出只能被那一个 GELU 用：否则删掉 matmul 会改掉别的观察者看到的值。
+- 为什么生成 `func.call` 前要检查 rank / 类型 / 布局：对不上 CUTLASS C ABI 就会静默算错。
+- 端到端 benchmark 为什么 fused 侧直接调 C++：MLIR JIT 不好喂动态形状 memref；IR 对不对由 `run_tests.sh` 单独测。
 
-## 7. 阶段五：QDQ 在 Tensor 上整图融合
 
-阶段四在 memref 上融合，OSB 已经为中间 f32 张量分配了显存。量化图（DQ → GEMM → bias → GELU → Q）若也走这条路，INT8 输入会先被展开成 f32 再 bufferize，融合就失去了意义。
 
-阶段五把匹配提前到 **Linalg-on-Tensor**：
+## 7. 阶段五：量化图在 Tensor 上整段融合
+
+几个词：
+
+- **QDQ**：INT8 和 FP32 互转。`x_f32 = (x_i8 - zp) * scale`，写回时再除 scale、加 zp、截断到 INT8。
+- **DPS**：结果写进 `outs` 参数，像 C 的输出指针，而不是 `return` 一块新内存。
+- **OSB**：One-Shot Bufferize。把 `tensor`（抽象数组）换成 `memref`（内存指针）。
+
+阶段四是在已经变成 memref 之后才匹配 GEMM+GELU，中间 FP32 矩阵这时已经被分配出来了。量化图如果也走这条路，INT8 会先被展开成 FP32 再分配，融合就没意义。所以阶段五在还是 tensor 时就把整条链收成一条 op：
 
 ```text
-DQ + linalg.matmul + bias + Fast-GELU + Q
-  -> cutlass.qgemm_bias_gelu   (DPS tensor)
-  -> one-shot-bufferize        (DPS memref，无 DQ/GELU alloc)
-  -> func.call @cutlass_qgemm_bias_gelu
+DQ(A)、DQ(B) -> matmul -> +bias -> Fast-GELU -> Q
+  -> cutlass.qgemm_bias_gelu
+  -> OSB（tensor 换成 memref，只给输出 D 分配）
+  -> call @cutlass_qgemm_bias_gelu
 ```
 
 重点文件：
 
-- `05_qdq_fusion/include/CutlassQGemm/CutlassQGemmOps.td`
-- `05_qdq_fusion/lib/FuseQdqPattern.cpp`
-- `05_qdq_fusion/lib/BufferizableOpInterfaceImpl.cpp`
-- `05_qdq_fusion/lib/LowerToCall.cpp`
-- `05_qdq_fusion/kernels/qgemm_bias_gelu.cu`
-- `05_qdq_fusion/runtime/cutlass_qgemm_bias_gelu_c_api.cu`
-- `05_qdq_fusion/test/qdq_pattern.mlir`
-- `05_qdq_fusion/test/run_tests.sh`
+- `CutlassQGemmOps.td`：声明这条指令长什么样
+- `FuseQdqPattern.cpp`：在 tensor IR 上匹配，插入这条指令
+- `BufferizableOpInterfaceImpl.cpp`：告诉 OSB 怎么把它换成 memref
+- `LowerToCall.cpp`：再换成 `func.call`
+- `kernels/qgemm_bias_gelu.cu`、`runtime/cutlass_qgemm_bias_gelu_c_api.cu`：INT8 kernel 和 C 接口
+- `test/qdq_pattern.mlir`、`test/run_tests.sh`
 
-量化是每张量 affine：`x_f32 = (x_i8 - zp) * scale`。zero-point 修正用 INT32 GEMM 累加加上 `sumA`/`sumB`，只在 C ABI 里算。Volta 没有 INT8 Tensor Core，所以 kernel 用 CUTLASS SIMT INT8 GEMM，再跑 bias + Fast-GELU + quantize。
+### `.td` 和 `.inc`
+
+`.td` 只描述「有一条叫 `cutlass.qgemm_bias_gelu` 的指令」：输入、输出 `D`、怎么打印。匹配和 bufferize 都不写在这里。
+
+CMake 用 `mlir-tblgen` 生成 `build/05_qdq_fusion/*.inc`（不要手改），展开成 C++ 类 `QgemmBiasGeluOp`。fuse / bufferize / lower 都用这个类去 `create` 或读写操作数。
+
+### OSB：对每个 op 调用 `bufferize()`
+
+测试命令：
+
+```bash
+qdq-opt test/qdq_pattern.mlir \
+  --fuse-qdq-qgemm-bias-gelu \
+  --one-shot-bufferize="bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map" \
+  --lower-cutlass-qgemm-to-call \
+  --canonicalize
+```
+
+OSB 会走遍函数里的每个 op，调用各自的 `bufferize()`。两个选项只控制 **`func.func` 那一步**的行为：
+
+- `bufferize-function-boundaries=1`：默认 OSB 只改函数体内部，函数参数和返回值保持 tensor 不变。开了这个选项，函数签名也会被 bufferize，参数/返回从 tensor 改成 memref。
+- `function-boundary-type-conversion=identity-layout-map`：签名里的 memref 用连续布局（`memref<64x64xi8>`），而不是带任意 stride 的版本。后面 `LowerToCall` 校验 identity layout，所以必须这样设。
+
+这两个选项**不影响** `cutlass.qgemm_bias_gelu` 的 bufferize；那条 op 的 `bufferize()` 是我们自己在 `BufferizableOpInterfaceImpl.cpp` 里写的。MLIR 不会给自定义 op 自动生成这个函数，所以 `qdq-opt` 启动时要先挂上：
+
+```cpp
+registry.insert<CutlassDialect>();
+registerCutlassBufferizationExternalModels(registry);
+```
+
+**`--fuse-qdq-qgemm-bias-gelu` 之后，函数体内 IR 是这个样子**（下一步 OSB 的输入）：
+
+```mlir
+func.func @f(%A: tensor<64x64xi8>, ...) -> tensor<64x64xi8> {
+  %0 = tensor.empty() : tensor<64x64xi8>        // 为输出 D 占位的空 tensor
+  %1 = cutlass.qgemm_bias_gelu ins(%A, ...) outs(%0) -> tensor<64x64xi8>
+  return %1
+}
+```
+
+注意：tensor 是值语义，不能原地改。`outs(%0)` 声明 `%0` 是写入目标（DPS），但仍然要有返回值 `%1` 让下游引用。
+
+**OSB 之后**，每个 op 都完成了自己的 `bufferize()`，结果变成：
+
+```mlir
+func.func @f(%A: memref<64x64xi8>, ...) -> memref<64x64xi8> {
+  %alloc = memref.alloc() : memref<64x64xi8>    // tensor.empty 的 bufferize 结果
+  cutlass.qgemm_bias_gelu ins(%A, ...) outs(%alloc)   // 无返回值，直接写进 %alloc
+  return %alloc
+}
+```
+
+三件事分别发生：
+1. `func.func` 的 `bufferize()`：参数 `%A` 和返回值从 tensor 改成 memref（受那两个选项控制）
+2. `tensor.empty` 的 `bufferize()`：变成 `memref.alloc`
+3. `cutlass.qgemm_bias_gelu` 的 `bufferize()`（即 `BufferizableOpInterfaceImpl.cpp`）：`getBuffer` 查出 `%A`、`%0` 各自对应哪块 memref，`create` 一条没有返回值的同名 op，再让原来用 `%1` 的地方改用 `%alloc`
+
+三步各管各的，互不依赖。
+
+zero-point 的行/列和只在 C ABI 里算，不进 MLIR。Volta 没有 INT8 Tensor Core，kernel 用 CUTLASS SIMT INT8 GEMM，再跑 bias + Fast-GELU + 量化。
 
 建议运行：
 
@@ -393,25 +476,30 @@ cd build && ctest -R stage5 --output-on-failure
 
 学习重点：
 
-- 为什么 QDQ 融合必须在 bufferize **之前**。
-- DPS + `BufferizableOpInterface` 如何让 OSB 不为中间激活分配 memref。
-- memref 形态的高阶 Op 不能标 `Pure`，否则 canonicalize 会删掉写内存的黑盒。
-- 阶段四（FP32 memref 融合）和阶段五（INT8 tensor 融合）各自解决什么问题。
+- 量化图要在变成 memref 之前融合，否则中间 FP32 会被分配出来。
+- OSB 对每个 op 调 `bufferize()`；自定义 op 必须自己挂上。
+- 函数签名、`tensor.empty`、`cutlass.qgemm_bias_gelu` 各走各的 `bufferize()`；我们写的那份是把返回值收成输出指针。
+- memref 形态不要标 `Pure`，否则 canonicalize 会把这条写内存的指令删掉。
+- 阶段四是 FP32、memref 上融合；阶段五是 INT8、tensor 上融合。
+
+
 
 ## 8. 验证与排障清单
 
-| 目标 | 命令 | 看什么 |
-| --- | --- | --- |
-| 全量功能验证 | `./scripts/build_all.sh` | 构建成功、静态脚本通过、`ctest` |
-| 只跑 CUDA correctness | `cd build && ctest -R stage[1-3] --output-on-failure` | 数值误差和 CUDA runtime 是否正常 |
-| 只跑 MLIR pass test | `cd build && ctest -R 'stage4|stage5_qdq' --output-on-failure` | 阶段四/五 IR rewrite |
-| 阶段五 INT8 kernel | `cd build && ctest -R stage5_qgemm --output-on-failure` | affine DQ+GEMM+bias+GELU+Q 与 CPU 参考 |
-| 验证 Tensor Core 指令 | `./02_cutlass_gemm/verify_mma_ptx.sh` | `mma.sync.aligned.m8n8k4`、无 `ld.local/st.local` |
-| 验证 SFU 指令（functor） | `./03_fastgelu_epilogue/verify_sfu_sass.sh` | `ex2.approx`、`rcp.approx`、`MUFU.EX2`、`MUFU.RCP` |
-| 验证 SFU 指令（Sm90 visitor） | `./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh` | 同上，且需 `sm_90a` 才有真实 WGMMA 主体 |
-| 阶段一 profile | `./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness_test` | `nsys` timeline、`ncu` SM/memory/occupancy |
-| 阶段二吞吐 | `./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096` | TFLOPS 和 speedup |
-| 阶段四延迟 | `./04_compiler_integration/benchmark_e2e.sh` | fused/unfused 总耗时和 latency change |
+
+| 目标                      | 命令                                                                             | 看什么                                             |
+| ----------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------- |
+| 全量功能验证                  | `./scripts/build_all.sh`                                                       | 构建成功、静态脚本通过、`ctest`                             |
+| 只跑 CUDA correctness     | `cd build && ctest -R stage[1-3] --output-on-failure`                          | 数值误差和 CUDA runtime 是否正常                         |
+| 只跑 MLIR pass test       | `cd build && ctest -R 'stage4|stage5_qdq' --output-on-failure` | 阶段四/五的 IR 是否按预期改写 |
+| 阶段五 INT8 kernel         | `cd build && ctest -R stage5_qgemm --output-on-failure`                        | GPU 结果是否和 CPU 参考一致 |
+| 验证 Tensor Core 指令       | `./02_cutlass_gemm/verify_mma_ptx.sh`                                          | `mma.sync.aligned.m8n8k4`、无 `ld.local/st.local` |
+| 验证 SFU 指令（functor）      | `./03_fastgelu_epilogue/verify_sfu_sass.sh`                                    | `ex2.approx`、`rcp.approx`、`MUFU.EX2`、`MUFU.RCP` |
+| 验证 SFU 指令（Sm90 visitor） | `./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh`                            | 同上，且需 `sm_90a` 才有真实 WGMMA 主体                    |
+| 阶段一 profile             | `./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness_test` | `nsys` timeline、`ncu` SM/memory/occupancy       |
+| 阶段二吞吐                   | `./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096`                | TFLOPS 和 speedup                                |
+| 阶段四延迟                   | `./04_compiler_integration/benchmark_e2e.sh`                                   | fused/unfused 总耗时和 latency change               |
+
 
 常见问题：
 
@@ -420,19 +508,27 @@ cd build && ctest -R stage5 --output-on-failure
 - `ERR_NVGPUCTRPERM` 表示性能计数器权限不足；本机需要 `sudo ncu`。
 - 小矩阵 correctness 结果不能代表 Tensor Core 吞吐；做性能对比要用大矩阵。
 
+
+
 ## 9. 推荐学习路线与时间安排
+
+
 
 ### 7 天路线
 
-| 时间 | 任务 | 产出 |
-| --- | --- | --- |
-| 第 1 天 | 阅读 `README.md`、`docs/spec.md`、`docs/environment.md`，完成构建 | 能解释五个阶段和当前环境约束 |
-| 第 2 天 | 学阶段一，读 `sgemm_naive.cu` / `sgemm_tiled_smem.cu` / `matrix_ref.hpp`，跑 stage1 correctness | 能解释 naive 与 tiled 的访存差异 |
-| 第 3 天 | 跑 `profile.sh`，看 `nsys`/`ncu` 指标 | 能读懂 SM throughput、memory throughput、occupancy |
-| 第 4 天 | 学阶段二：先弄清「纯 GEMM、不是融合」，对照 `cutlass_gemm.cu` 与 `fused_gemm_gelu.cu` 的差异；跑 `verify_mma_ptx.sh` 和大矩阵 benchmark | 能指出 epilogue 插槽，并解释 Tensor Core 与小/大矩阵差异 |
-| 第 5 天 | 学阶段三 functor 路径，读 `FastGeluPTX` 和 epilogue op，跑 SFU 验证；再对照 Sm90 visitor 文件与 `verify_sfu_visitor_sm90.sh` | 能解释 functor vs visitor 与 SFU 误差验收 |
-| 第 6 天 | 学阶段四，读 pattern matching 和 external call emission，跑 stage4 test | 能解释 MLIR IR 如何变成外部 fused call |
-| 第 7 天 | 学阶段五：对照 `qdq_pattern.mlir` 和三段 `qdq-opt` dump；跑 `ctest -R stage5` | 能解释 tensor 融合为何能避免 OSB 中间 alloc |
+
+| 时间    | 任务                                                                                                         | 产出                                            |
+| ----- | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| 第 1 天 | 阅读 `README.md`、`docs/spec.md`、`docs/environment.md`，完成构建                                                   | 能解释五个阶段和当前环境约束                                |
+| 第 2 天 | 学阶段一，读 `sgemm_naive.cu` / `sgemm_tiled_smem.cu` / `matrix_ref.hpp`，跑 stage1 correctness                    | 能解释 naive 与 tiled 的访存差异                       |
+| 第 3 天 | 跑 `profile.sh`，看 `nsys`/`ncu` 指标                                                                           | 能读懂 SM throughput、memory throughput、occupancy |
+| 第 4 天 | 学阶段二：先弄清「纯 GEMM、不是融合」，对照 `cutlass_gemm.cu` 与 `fused_gemm_gelu.cu` 的差异；跑 `verify_mma_ptx.sh` 和大矩阵 benchmark | 能指出 epilogue 插槽，并解释 Tensor Core 与小/大矩阵差异      |
+| 第 5 天 | 学阶段三 functor 路径，读 `FastGeluPTX` 和 epilogue op，跑 SFU 验证；再对照 Sm90 visitor 文件与 `verify_sfu_visitor_sm90.sh`   | 能解释 functor vs visitor 与 SFU 误差验收             |
+| 第 6 天 | 学阶段四，读 pattern matching 和 external call emission，跑 stage4 test                                             | 能解释 MLIR IR 如何变成外部 fused call                 |
+| 第 7 天 | 学阶段五：对照 `qdq_pattern.mlir` 和三段 `qdq-opt` dump；跑 `ctest -R stage5` | 能说出为什么量化图要在变成 memref 之前融合 |
+
+
+
 
 ### 进阶练习
 
@@ -442,6 +538,8 @@ cd build && ctest -R stage5 --output-on-failure
 - 给阶段四增加一个负例 MLIR 测试：非 identity layout 或 rank 不是 2 时，确认 pass 报错而不是生成 external call。
 - 给阶段五增加 zp=0（省略 `subf`/`addf`）的 DQ/Q 变体，确认 matcher 仍能抽出 scale 并插入 zp=0 常量。
 
+
+
 ## 10. 阅读顺序建议
 
-先读 `common/matrix_ref.hpp`，理解 correctness 的地基；再按 `01 -> 02 -> 03 -> 04 -> 05` 目录推进。不要先从 MLIR pass 开始，否则很容易看懂了 IR rewrite，却不清楚它最终调用的 CUDA kernel 为什么可靠、为什么快。阶段五应在理解阶段四 memref 融合的局限之后再读。
+先读 `common/matrix_ref.hpp`，理解 correctness 怎么比。然后按 `01 -> 02 -> 03 -> 04 -> 05` 读。不要先从 MLIR pass 开始：你会看懂 IR 怎么改，却不知道最后调用的 CUDA kernel 为什么对、为什么快。阶段五要在弄清阶段四「已经变成 memref 再融合」的局限之后再读。
