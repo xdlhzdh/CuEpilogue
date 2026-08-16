@@ -85,8 +85,9 @@ struct FastGeluPTX {
   - **Tensor 匹配:** pass `-fuse-qdq-qgemm-bias-gelu` 在 bufferize 之前匹配 DQ generic、`linalg.matmul`、bias 广播 generic、Fast-GELU（`exp2` + `-2.455492`）、Q generic；整条链单消费者。
   - **OSB:** `--one-shot-bufferize="bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map"`。图上只剩高阶 Op 时，不应再出现 `linalg.matmul` / GELU / DQ-Q generic。
   - **Lowering:** `-lower-cutlass-qgemm-to-call` 插入 private 声明并替换为 `func.call @cutlass_qgemm_bias_gelu`。
-  - **Kernel:** CUTLASS INT8 GEMM（Volta 无 INT8 Tensor Core，故用 SIMT `int8`×`int8`→`int32`；Turing+ 才有 `mma.sync.aligned.m8n8k16`）+ affine zp + bias + 同一套 `FastGeluPTX` + quantize；封装为 `libcutlass_qgemm_bias_gelu_runtime.so`。
-- **验收标准:** `qdq-opt` 三段 IR：fuse 后出现 `cutlass.qgemm_bias_gelu` 且无 `linalg.matmul`；OSB 后 operand 为 memref；lower 后为 `call @cutlass_qgemm_bias_gelu`。GPU 上 kernel 与 CPU affine 参考一致；无 GPU 时 IR 测试仍可跑。
+  - **Kernel（默认）:** CUTLASS INT8 GEMM（Volta 无 INT8 Tensor Core，故用 SIMT `int8`×`int8`→`int32`）+ affine zp + bias + 同一套 `FastGeluPTX` + quantize；封装为 `libcutlass_qgemm_bias_gelu_runtime.so`。
+  - **Kernel（旁路，Hopper）：** CUTLASS 3.x `CollectiveBuilder` + `LinCombEltAct<FastGeluQuant>`（INT8 Tensor Core WGMMA）。需 `-DCU_EPILOGUE_ENABLE_SM90_VISITOR=ON`，nvcc 目标 `sm_90a`。数值 correctness 需 Hopper（cc ≥ 9.0），否则 SKIP；仍可做编译与静态 PTX/SASS。不替换默认 C ABI `.so`。
+- **验收标准:** `qdq-opt` 三段 IR：fuse 后出现 `cutlass.qgemm_bias_gelu` 且无 `linalg.matmul`；OSB 后 operand 为 memref；lower 后为 `call @cutlass_qgemm_bias_gelu`。GPU 上默认 SIMT kernel 与 CPU affine 参考一致；无 GPU 时 IR 测试仍可跑。Visitor 路径：静态 SFU 检查 + Hopper 上 correctness（或 SKIP）。
 
 ## 4. 关键技术风险与排查路径 (Risk Mitigation)
 

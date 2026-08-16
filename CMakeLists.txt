@@ -12,10 +12,11 @@ project(CuEpilogue LANGUAGES C CXX)
 option(CU_EPILOGUE_ENABLE_CUDA "Enable CUDA stages (1-3): requires nvcc" ON)
 option(CU_EPILOGUE_ENABLE_MLIR "Enable MLIR stages (4-5): requires LLVM/MLIR" ON)
 option(CU_EPILOGUE_BUILD_TESTS "Build correctness / verification tests" ON)
-# Side-by-side CUTLASS 3.x Sm90 EVT / FusionCallbacks Fast-GELU path (stage 3).
-# Compiles that target for sm_90a regardless of CU_EPILOGUE_CUDA_ARCH; device
-# correctness skips on GPUs with compute capability < 90. Stage 4 still uses
-# the Sm70 functor path.
+# Side-by-side CUTLASS 3.x Sm90 EVT / FusionCallbacks path (stage 3 Fast-GELU
+# and stage 5 INT8 QGEMM). Compiles those targets for sm_90a regardless of
+# CU_EPILOGUE_CUDA_ARCH; device correctness skips on GPUs with compute
+# capability < 90. Stage 4 runtime and stage 5 C ABI still use the default
+# (Sm70 functor / SIMT) kernels.
 option(CU_EPILOGUE_ENABLE_SM90_VISITOR "Build Sm90 CollectiveBuilder + LinCombEltAct visitor epilogue" ON)
 
 set(CMAKE_CXX_STANDARD 17)

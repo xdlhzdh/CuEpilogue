@@ -56,11 +56,11 @@ spec 建议 Ampere 及以上架构，但本项目实际目标硬件是 Volta，�
 
 ### Sm90 visitor 旁路（Hopper）
 
-阶段三另有一条 CUTLASS 3.x visitor / EVT 路径（`CU_EPILOGUE_ENABLE_SM90_VISITOR`，默认 ON）：
+阶段三、五另有 CUTLASS 3.x visitor / EVT 路径（`CU_EPILOGUE_ENABLE_SM90_VISITOR`，默认 ON）：
 
-- 该目标单独以 **`CUDA_ARCHITECTURES=90a`** 编译（WGMMA 需要 `__CUDA_ARCH_FEAT_SM90_ALL`；plain `sm_90` 会编出仅 `printf` 的 stub）
-- 不改变默认 `CU_EPILOGUE_CUDA_ARCH=70`，也不替换阶段四 runtime（仍走 Sm70 functor）
-- 本机 V100 上：可做编译 + `./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh` 静态验收；`stage3_visitor_correctness_test` 在 cc &lt; 90 时 SKIP
+- 这些目标单独以 **`CUDA_ARCHITECTURES=90a`** 编译（WGMMA 需要 `__CUDA_ARCH_FEAT_SM90_ALL`；plain `sm_90` 会编出仅 `printf` 的 stub）
+- 不改变默认 `CU_EPILOGUE_CUDA_ARCH=70`；阶段四 runtime 仍走 Sm70 functor，阶段五默认 C ABI 仍走 SIMT INT8 kernel
+- 本机 V100 上：可做编译 + `./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh` / `./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh` 静态验收；`stage3_visitor_correctness_test` / `stage5_visitor_correctness_test` 在 cc &lt; 90 时 SKIP
 - 关闭：`cmake -B build -DCU_EPILOGUE_ENABLE_SM90_VISITOR=OFF`
 
 ## 3. 历史：项目最初的 WSL2 沙盒环境

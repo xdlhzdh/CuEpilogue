@@ -99,4 +99,38 @@ if(CU_EPILOGUE_ENABLE_CUDA AND TARGET cu_epilogue_common)
     target_link_libraries(stage5_qgemm_correctness_test PRIVATE qgemm_bias_gelu)
     add_test(NAME stage5_qgemm_correctness_test COMMAND stage5_qgemm_correctness_test)
   endif()
+
+  # CUTLASS 3.x Sm90 visitor / EVT path (side-by-side with the SIMT kernel).
+  # Hopper WGMMA needs sm_90a; plain sm_90 compiles to a stub. Default C ABI
+  # .so stays on the SIMT kernel above.
+  if(CU_EPILOGUE_ENABLE_SM90_VISITOR)
+    add_library(qgemm_bias_gelu_visitor_sm90 STATIC
+      kernels/qgemm_bias_gelu_visitor_sm90.cu
+    )
+    target_include_directories(qgemm_bias_gelu_visitor_sm90 PUBLIC
+      ${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      ${CMAKE_SOURCE_DIR}/03_fastgelu_epilogue
+    )
+    target_link_libraries(qgemm_bias_gelu_visitor_sm90 PUBLIC
+      cu_epilogue_common cutlass_headers
+    )
+    set_target_properties(qgemm_bias_gelu_visitor_sm90 PROPERTIES
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_ARCHITECTURES 90a
+    )
+
+    if(CU_EPILOGUE_BUILD_TESTS)
+      add_executable(stage5_visitor_correctness_test
+        kernels/correctness_test_visitor.cu
+      )
+      target_link_libraries(stage5_visitor_correctness_test PRIVATE
+        qgemm_bias_gelu_visitor_sm90
+      )
+      set_target_properties(stage5_visitor_correctness_test PROPERTIES
+        CUDA_ARCHITECTURES 90a
+      )
+      add_test(NAME stage5_visitor_correctness_test
+        COMMAND stage5_visitor_correctness_test)
+    endif()
+  endif()
 endif()

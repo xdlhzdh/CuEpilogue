@@ -403,7 +403,8 @@ DQ(A)、DQ(B) -> matmul -> +bias -> Fast-GELU -> Q
 - `FuseQdqPattern.cpp`：在 tensor IR 上匹配，插入这条指令
 - `BufferizableOpInterfaceImpl.cpp`：告诉 OSB 怎么把它换成 memref
 - `LowerToCall.cpp`：再换成 `func.call`
-- `kernels/qgemm_bias_gelu.cu`、`runtime/cutlass_qgemm_bias_gelu_c_api.cu`：INT8 kernel 和 C 接口
+- `kernels/qgemm_bias_gelu.cu`、`runtime/cutlass_qgemm_bias_gelu_c_api.cu`：默认 INT8 kernel 和 C 接口
+- `kernels/qgemm_bias_gelu_visitor_sm90.cu`、`fast_gelu_quant.cuh`：Sm90 visitor 旁路
 - `test/qdq_pattern.mlir`、`test/run_tests.sh`
 
 ### `.td` 和 `.inc`
@@ -465,7 +466,20 @@ func.func @f(%A: memref<64x64xi8>, ...) -> memref<64x64xi8> {
 
 三步各管各的，互不依赖。
 
-zero-point 的行/列和只在 C ABI 里算，不进 MLIR。Volta 没有 INT8 Tensor Core，kernel 用 CUTLASS SIMT INT8 GEMM，再跑 bias + Fast-GELU + 量化。
+zero-point 的行/列和只在 C ABI 里算，不进 MLIR。Volta 没有 INT8 Tensor Core，默认 kernel 用 CUTLASS SIMT INT8 GEMM，再跑 bias + Fast-GELU + 量化。
+
+### Sm90 visitor 旁路
+
+和阶段三同一开关 `CU_EPILOGUE_ENABLE_SM90_VISITOR`，单独编 `sm_90a`。MLIR 管线和下发的 `.so` 仍走 SIMT；visitor 只是另一条 CUDA 实现。
+
+写法：`CollectiveBuilder` 做 INT8×INT8→int32 主循环，epilogue 用 `LinCombEltAct<FastGeluQuant>`——先 Fast-GELU，再 `q = g/sd + zd` 并截断。CUTLASS 3.5.1 的 `LinCombPerRowBias` 广播的是长度为 M 的列，不是 `bias[n]`，所以 zp 修正和 bias 先写进一张 float `C`，再 `alpha = sa*sb`、`beta = 1`。测试矩阵要对齐 16（例如 64³、128×64×64），不要用 SIMT 那组 32×48×40。
+
+```bash
+./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh
+cd build && ctest -R stage5_visitor_correctness_test --output-on-failure
+```
+
+V100 上静态 SFU 检查能过；correctness 会 SKIP（需要 Hopper）。
 
 建议运行：
 
@@ -481,6 +495,7 @@ cd build && ctest -R stage5 --output-on-failure
 - 函数签名、`tensor.empty`、`cutlass.qgemm_bias_gelu` 各走各的 `bufferize()`；我们写的那份是把返回值收成输出指针。
 - memref 形态不要标 `Pure`，否则 canonicalize 会把这条写内存的指令删掉。
 - 阶段四是 FP32、memref 上融合；阶段五是 INT8、tensor 上融合。
+- 默认 kernel 是 SIMT；Sm90 visitor 是旁路，不替换 C ABI。
 
 
 
@@ -493,6 +508,7 @@ cd build && ctest -R stage5 --output-on-failure
 | 只跑 CUDA correctness     | `cd build && ctest -R stage[1-3] --output-on-failure`                          | 数值误差和 CUDA runtime 是否正常                         |
 | 只跑 MLIR pass test       | `cd build && ctest -R 'stage4|stage5_qdq' --output-on-failure` | 阶段四/五的 IR 是否按预期改写 |
 | 阶段五 INT8 kernel         | `cd build && ctest -R stage5_qgemm --output-on-failure`                        | GPU 结果是否和 CPU 参考一致 |
+| 阶段五 Sm90 visitor        | `./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh`；`ctest -R stage5_visitor` | SFU 指令；cc&lt;90 时 correctness SKIP |
 | 验证 Tensor Core 指令       | `./02_cutlass_gemm/verify_mma_ptx.sh`                                          | `mma.sync.aligned.m8n8k4`、无 `ld.local/st.local` |
 | 验证 SFU 指令（functor）      | `./03_fastgelu_epilogue/verify_sfu_sass.sh`                                    | `ex2.approx`、`rcp.approx`、`MUFU.EX2`、`MUFU.RCP` |
 | 验证 SFU 指令（Sm90 visitor） | `./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh`                            | 同上，且需 `sm_90a` 才有真实 WGMMA 主体                    |
@@ -525,7 +541,7 @@ cd build && ctest -R stage5 --output-on-failure
 | 第 4 天 | 学阶段二：先弄清「纯 GEMM、不是融合」，对照 `cutlass_gemm.cu` 与 `fused_gemm_gelu.cu` 的差异；跑 `verify_mma_ptx.sh` 和大矩阵 benchmark | 能指出 epilogue 插槽，并解释 Tensor Core 与小/大矩阵差异      |
 | 第 5 天 | 学阶段三 functor 路径，读 `FastGeluPTX` 和 epilogue op，跑 SFU 验证；再对照 Sm90 visitor 文件与 `verify_sfu_visitor_sm90.sh`   | 能解释 functor vs visitor 与 SFU 误差验收             |
 | 第 6 天 | 学阶段四，读 pattern matching 和 external call emission，跑 stage4 test                                             | 能解释 MLIR IR 如何变成外部 fused call                 |
-| 第 7 天 | 学阶段五：对照 `qdq_pattern.mlir` 和三段 `qdq-opt` dump；跑 `ctest -R stage5` | 能说出为什么量化图要在变成 memref 之前融合 |
+| 第 7 天 | 学阶段五：对照 `qdq_pattern.mlir` 和三段 `qdq-opt` dump；跑 `ctest -R stage5`；对照 visitor 与 `verify_sfu_visitor_sm90.sh` | 能说出为什么量化图要在变成 memref 之前融合，以及 SIMT vs Sm90 visitor |
 
 
 

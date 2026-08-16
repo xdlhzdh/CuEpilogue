@@ -27,6 +27,10 @@ echo "== Stage 3: static PTX/SASS SFU instruction check =="
 ./03_fastgelu_epilogue/verify_sfu_sass.sh || echo "(non-fatal: see output above)"
 
 echo
+echo "== Stage 5: static Sm90 QGEMM visitor SFU check (optional, needs sm_90a compile) =="
+./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh || echo "(non-fatal: see output above)"
+
+echo
 echo "== Stage 4: fusion pass test (runs fully in any environment, no GPU needed) =="
 ./04_compiler_integration/test/run_tests.sh build/04_compiler_integration/fused-opt
 

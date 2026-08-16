@@ -12,7 +12,7 @@ Fused GEMM + Epilogue (Fast-GELU) 自定义算子开发与编译器集成 ——
 | 2 | `02_cutlass_gemm/` | CUTLASS GEMM：FP16 输入 / FP32 累加，配置 Threadblock/Warp/Instruction Shape 触发 Tensor Core `mma.sync.aligned` |
 | 3 | `03_fastgelu_epilogue/` | Inline PTX Fast-GELU：functor（Sm70 `device::Gemm`）与 Sm90 visitor（`CollectiveBuilder` + `LinCombEltAct`）并存；阶段四默认走 functor |
 | 4 | `04_compiler_integration/` | MLIR 编译器后端集成：`fused-opt` 在 Bufferization 后把 `linalg.matmul`+`linalg.generic` 替换为对外部 CUTLASS 算子 `.so` 的 `call`（FP32 GEMM+GELU） |
-| 5 | `05_qdq_fusion/` | QDQ 整图融合：tensor 上匹配 DQ+Matmul+Bias+Fast-GELU+Q，插入 `cutlass.qgemm_bias_gelu`，OSB 后 lower 为 INT8 fused kernel 调用 |
+| 5 | `05_qdq_fusion/` | QDQ 整图融合：tensor 上匹配 DQ+Matmul+Bias+Fast-GELU+Q，插入 `cutlass.qgemm_bias_gelu`，OSB 后 lower 为 INT8 fused kernel；默认 SIMT，旁路 Sm90 visitor |
 
 四个阶段依次递进，均已实现；每个阶段的目的、运行方法和验收结果见下文「验收结果总览」。
 
@@ -59,7 +59,7 @@ cmake --build build -j$(nproc)
 | --- | --- | --- |
 | `CU_EPILOGUE_CUDA_ARCH` | `70` | 目标 SM 架构（70/80/86/89/90...）；作用于阶段一～三 functor 路径 |
 | `CU_EPILOGUE_ENABLE_CUDA` | `ON` | 是否构建阶段一~三（需要 `nvcc`，找不到会自动关闭并给出警告） |
-| `CU_EPILOGUE_ENABLE_SM90_VISITOR` | `ON` | 是否构建阶段三 Sm90 visitor 旁路（单独编 `sm_90a`；设备 correctness 需 Hopper） |
+| `CU_EPILOGUE_ENABLE_SM90_VISITOR` | `ON` | 是否构建阶段三/五 Sm90 visitor 旁路（单独编 `sm_90a`；设备 correctness 需 Hopper） |
 | `CU_EPILOGUE_ENABLE_MLIR` | `ON` | 是否构建阶段四、五（需要 `find_package(MLIR)` 成功） |
 | `CU_EPILOGUE_BUILD_TESTS` | `ON` | 是否注册 `ctest` 测试 |
 
@@ -81,7 +81,7 @@ cmake --build build -j$(nproc)
 | 2. CUTLASS Tensor Core GEMM | 用 CUTLASS FP16 Tensor Core GEMM 替代阶段一手写 FP32 kernel，并验证吞吐显著提升 | `cd build && ctest -R stage2_correctness_test --output-on-failure`；`./02_cutlass_gemm/verify_mma_ptx.sh`；`./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096` | `ctest` 通过；PTX 含 `mma.sync.aligned.m8n8k4`；4096³ 下阶段一 **3.05 TFLOPS**、阶段二 **36.27 TFLOPS**，**11.9× 加速** |
 | 3. Fast-GELU Epilogue | 把 Fast-GELU 融合进 CUTLASS Epilogue，GEMM 输出在寄存器路径中完成激活，避免中间张量落显存 | Functor：`ctest -R stage3_correctness_test`；`./03_fastgelu_epilogue/verify_sfu_sass.sh`。Visitor：`./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh`；`ctest -R stage3_visitor`（cc&lt;90 时 SKIP） | Functor：`ctest` 通过；PTX/SASS 含 SFU。Visitor：`sm_90a` 下 PTX 含 `ex2.approx`/`rcp.approx`，SASS 含 `MUFU.EX2`/`MUFU.RCP`；V100 上 correctness SKIP |
 | 4. MLIR compiler integration | 在 MLIR 后端识别 `linalg.matmul + linalg.generic`，改写为对外部 fused CUTLASS kernel 的调用 | `cd build && ctest -R stage4 --output-on-failure`；`./04_compiler_integration/benchmark_e2e.sh` | fusion pass 测试通过；20 次 fused 调用 **0.68ms**，未融合标量 CPU 循环 **148.3ms**，端到端延迟下降 **99.5%** |
-| 5. QDQ tensor fusion | 在 Linalg-on-Tensor 上融合 DQ+Matmul+Bias+Fast-GELU+Q 为 `cutlass.qgemm_bias_gelu`，OSB 后 lower 成 INT8 kernel 调用 | `cd build && ctest -R stage5 --output-on-failure` | IR 三段（fuse / OSB / func.call）通过；GPU 上 INT8 kernel 与 CPU affine 参考一致 |
+| 5. QDQ tensor fusion | 在 Linalg-on-Tensor 上融合 DQ+Matmul+Bias+Fast-GELU+Q 为 `cutlass.qgemm_bias_gelu`，OSB 后 lower 成 INT8 kernel 调用 | `cd build && ctest -R stage5 --output-on-failure`；visitor：`./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh`；`ctest -R stage5_visitor`（cc&lt;90 时 SKIP） | IR 三段通过；默认 SIMT kernel 与 CPU affine 参考一致。Visitor：`sm_90a` 下 PTX/SASS 含 SFU；V100 上 correctness SKIP |
 
 `ctest` 汇总：`cd build && ctest --output-on-failure`（含阶段五 IR + GPU kernel）。
 
@@ -89,7 +89,7 @@ cmake --build build -j$(nproc)
 
 阶段四在 **bufferize 之后**才匹配 GEMM+GELU，中间 f32 张量已经变成 `memref.alloc`。若 DQ/Q 也走同一路径，OSB 会为 `A_f32`、`acc`、`gelu` 等中间结果分配显存，量化图的意义就没了。
 
-阶段五在 tensor 上先收成 DPS 高阶 Op `cutlass.qgemm_bias_gelu`：OSB 只 bufferize 已有的 `ins/outs`（INT8 A/B/D 和 f32 bias），再 `-lower-cutlass-qgemm-to-call` 变成 `func.call @cutlass_qgemm_bias_gelu`。量化是每张量 INT8 affine（`scale` + `zero-point`）；zero-point 修正留在 C ABI 内部，不把 row/col sum 暴露到 MLIR。Volta 没有 INT8 Tensor Core，kernel 用 CUTLASS SIMT INT8 GEMM + Fast-GELU epilogue。阶段四仍是 FP32 GEMM+GELU，保持不动。
+阶段五在 tensor 上先收成 DPS 高阶 Op `cutlass.qgemm_bias_gelu`：OSB 只 bufferize 已有的 `ins/outs`（INT8 A/B/D 和 f32 bias），再 `-lower-cutlass-qgemm-to-call` 变成 `func.call @cutlass_qgemm_bias_gelu`。量化是每张量 INT8 affine（`scale` + `zero-point`）；zero-point 修正留在 C ABI 内部，不把 row/col sum 暴露到 MLIR。Volta 没有 INT8 Tensor Core，默认 kernel 用 CUTLASS SIMT INT8 GEMM + Fast-GELU epilogue。旁路与阶段三相同：`CollectiveBuilder` + `LinCombEltAct`（Fast-GELU 再量化），单独编 `sm_90a`，不替换默认 `.so`。阶段四仍是 FP32 GEMM+GELU，保持不动。
 
 ### 阶段二：为什么 `ctest` 里阶段二看起来反而更慢？
 
@@ -150,7 +150,7 @@ cmake --build build -j$(nproc)
 - **阶段二：换成 CUTLASS + Tensor Core**（`02_cutlass_gemm/cutlass_gemm.cu`）：不再手写乘加循环，改用 NVIDIA 的 CUTLASS 库，让 V100 的 Tensor Core 干矩阵乘（编译后能看到 `mma.sync.aligned.m8n8k4` 指令）。输入矩阵用 FP16 省带宽，累加和输出仍用 FP32 保精度。一次处理 128×128 的子块（`ThreadblockShape<128,128,32>`）；Volta 没有 `cp.async`，流水线只能做 2 级，没法像新卡那样叠很多层预取。阶段三在**同一套矩阵乘配置**上，只改「乘完之后干什么」。
 - **阶段三：乘完立刻算 GELU，不落显存**（`03_fastgelu_epilogue/`）：普通做法是 GEMM 先把结果写回显存，再另起一个 kernel 做 GELU。这里把 GELU 塞进 CUTLASS 的 epilogue——矩阵乘累加完成后，在寄存器里直接做 `α·acc + β·C`，紧接着用 `FastGeluPTX`（`fast_gelu_ptx.cuh`）算 GELU，全程不经过中间张量。GELU 走 GPU 的 SFU 近似指令（`ex2.approx` / `rcp.approx`），`fast_gelu_epilogue_op.cuh` 把它包装成 CUTLASS 能识别的 epilogue 接口，替换原来的线性组合输出。
 - **阶段四：编译器认出「矩阵乘 + GELU」并合成一次调用**（`04_compiler_integration/`）：`FuseGemmGeluPattern.cpp` 在 MLIR 里找这样的模式——`linalg.matmul` 的输出**只**被一个逐元素激活（GELU）消费，且两者已经 bufferize 成内存上的张量。匹配成功就把两个算子删掉，改成调用外部函数 `@cutlass_fused_gemm_gelu`。`EmitExternalCall.cpp` 在生成调用前检查张量是不是 2D、是不是 f32、布局对不对，不对就直接报错，避免生成错误的 C 接口。`runtime/cutlass_fused_gemm_gelu_c_api.cu` 把阶段三的 kernel 包成这个外部函数，打进 `libcutlass_fused_gemm_gelu_runtime.so`，供 MLIR 生成的代码链接调用。
-- **阶段五：量化图在 tensor 上整段融合**（`05_qdq_fusion/`）：`-fuse-qdq-qgemm-bias-gelu` 匹配 DQ + `linalg.matmul` + bias + Fast-GELU + Q，插入 `cutlass.qgemm_bias_gelu`；One-Shot Bufferize 把它变成 memref 黑盒；`-lower-cutlass-qgemm-to-call` 发出 `@cutlass_qgemm_bias_gelu`。INT8 kernel 与 C ABI 在 `kernels/` 和 `runtime/`。
+- **阶段五：量化图在 tensor 上整段融合**（`05_qdq_fusion/`）：`-fuse-qdq-qgemm-bias-gelu` 匹配 DQ + `linalg.matmul` + bias + Fast-GELU + Q，插入 `cutlass.qgemm_bias_gelu`；One-Shot Bufferize 把它变成 memref 黑盒；`-lower-cutlass-qgemm-to-call` 发出 `@cutlass_qgemm_bias_gelu`。默认 INT8 kernel 与 C ABI 在 `kernels/qgemm_bias_gelu.cu` 和 `runtime/`；Sm90 visitor 在 `kernels/qgemm_bias_gelu_visitor_sm90.cu`。
 
 ## 关键风险与当前状态（对应 spec 第 4 节）
 
