@@ -466,7 +466,7 @@ func.func @f(%A: memref<64x64xi8>, ...) -> memref<64x64xi8> {
 
 三步各管各的，互不依赖。
 
-zero-point 的行/列和只在 C ABI 里算，不进 MLIR。Volta 没有 INT8 Tensor Core，默认 kernel 用 CUTLASS SIMT INT8 GEMM，再跑 bias + Fast-GELU + 量化。
+zero-point 的行/列和只在 C ABI 里算，不进 MLIR。A/B 的量化（FP32→INT8）不在 fused op 里，见 `common/quantize_affine.hpp`。pattern 删掉的是图上的 DQ/Q；默认 kernel 用 CUTLASS SIMT INT8 GEMM，epilogue（`qgemm_epilogue_op.cuh`）做累加器去量化、Fast-GELU 和 D 的 Q。
 
 ### Sm90 visitor 旁路
 
@@ -495,7 +495,7 @@ cd build && ctest -R stage5 --output-on-failure
 - 函数签名、`tensor.empty`、`cutlass.qgemm_bias_gelu` 各走各的 `bufferize()`；我们写的那份是把返回值收成输出指针。
 - memref 形态不要标 `Pure`，否则 canonicalize 会把这条写内存的指令删掉。
 - 阶段四是 FP32、memref 上融合；阶段五是 INT8、tensor 上融合。
-- 默认 kernel 是 SIMT；Sm90 visitor 是旁路，不替换 C ABI。
+- 默认 kernel 是 SIMT；epilogue 里完成累加器去量化和输出 Q。Sm90 visitor 是旁路，不替换 C ABI。
 
 
 
