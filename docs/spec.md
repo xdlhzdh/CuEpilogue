@@ -89,6 +89,17 @@ struct FastGeluPTX {
   - **Kernel（旁路，Hopper）：** CUTLASS 3.x `CollectiveBuilder` + `LinCombEltAct<FastGeluQuant>`（INT8 Tensor Core WGMMA）。需 `-DCU_EPILOGUE_ENABLE_SM90_VISITOR=ON`，nvcc 目标 `sm_90a`。数值 correctness 需 Hopper（cc ≥ 9.0），否则 SKIP；仍可做编译与静态 PTX/SASS。不替换默认 C ABI `.so`。
 - **验收标准:** `qdq-opt` 三段 IR：fuse 后出现 `cutlass.qgemm_bias_gelu` 且无 `linalg.matmul`；OSB 后 operand 为 memref；lower 后为 `call @cutlass_qgemm_bias_gelu`。GPU 上默认 SIMT kernel 与 CPU affine 参考一致；无 GPU 时 IR 测试仍可跑。Visitor 路径：静态 SFU 检查 + Hopper 上 correctness（或 SKIP）。
 
+### 阶段六：TVM Relax BYOC（复用阶段五 INT8 fused `.so`）
+
+- **目标:** 在 TVM Relax 上识别与阶段五同语义的 DQ+Matmul+Bias+FastGELU+Q 子图，切分为 composite，并绑定到已有的 `libcutlass_qgemm_bias_gelu_runtime.so`（不重写 CUTLASS kernel）。
+- **量化 / 激活语义:** 与阶段五相同（affine zp + SFU FastGELU 近似）；V100 走 SIMT 路径。
+- **实现细节:**
+  - `06_tvm_cutlass_byoc/python/relax_patterns.py`：BlockBuilder 手写 Relax IR；dataflow walker 匹配 QDQ 链。
+  - `relax_pipeline.py`：annotate `Composite=cutlass.qgemm_bias_gelu` → rewrite 为 `call_dps_packed("cu_epilogue.qgemm_bias_gelu")`。
+  - `so_wrapper.py`：ctypes 加载阶段五 `.so`；packed func 内 launch。
+  - 构建：`-DCU_EPILOGUE_ENABLE_TVM=ON`；先 `06_tvm_cutlass_byoc/scripts/setup_tvm.sh` 安装 apache-tvm 到 `06_tvm_cutlass_byoc/.venv`。
+- **验收标准:** pytest M1–M3 通过（≤1 LSB，pattern 负例不匹配，e2e 单次 packed launch）；`bench_e2e.py` 相对 NumPy 未融合基线 ≥1.5×；nsys 确认无独立 DQ/GELU/Q compute kernel（与阶段五相同：RowSum+Gemm+ColSum）。报告见 `06_tvm_cutlass_byoc/docs/benchmarking_report.md`。
+
 ## 4. 关键技术风险与排查路径 (Risk Mitigation)
 
 1. **寄存器溢出 (Register Spilling):**

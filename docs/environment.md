@@ -22,6 +22,7 @@
 | Nsight Systems / Compute | `nsys` 2025.1.3；`ncu` 装了两个版本：`2025.2.1`（能用）和 `2026.2.1`（与 535 驱动不兼容，见下） | `ncu` 还需要 `sudo`，见下 |
 | LLVM / MLIR | 23.0.0git，`mlir-opt` / `llvm-config` / `MLIRConfig.cmake` 均在 `/usr/local` | 阶段四、五依赖 |
 | CUTLASS | v3.5.1，CMake `FetchContent` 自动拉取 | |
+| Apache TVM | 0.26.0（`06_tvm_cutlass_byoc/.venv`，`06_tvm_cutlass_byoc/scripts/setup_tvm.sh`） | 阶段六；默认 `CU_EPILOGUE_ENABLE_TVM=OFF` |
 
 ### 为什么编译必须用 CUDA 12.x
 

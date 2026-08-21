@@ -33,6 +33,7 @@ D = GELU(A @ B)
 | `03_fastgelu_epilogue/`    | Fast-GELU inline PTX；functor epilogue（Sm70）与 Sm90 visitor（`LinCombEltAct` / EVT）；SFU 指令验证 |
 | `04_compiler_integration/` | 阶段四：在 memref 上匹配 GEMM+GELU，改成调用 `.so` |
 | `05_qdq_fusion/`           | 阶段五：在 tensor 上匹配量化图，bufferize 后再调用 INT8 kernel |
+| `06_tvm_cutlass_byoc/`     | 阶段六：TVM Relax 匹配同语义 QDQ 链，packed 调用阶段五 `.so` |
 | `scripts/`                 | 一键构建和功能验证                                                                                 |
 | `docs/`                    | spec、环境说明和本学习手册                                                                           |
 
@@ -497,6 +498,37 @@ cd build && ctest -R stage5 --output-on-failure
 - 阶段四是 FP32、memref 上融合；阶段五是 INT8、tensor 上融合。
 - 默认 kernel 是 SIMT；epilogue 里完成累加器去量化和输出 Q。Sm90 visitor 是旁路，不替换 C ABI。
 
+## 7.5 阶段六：TVM Relax BYOC
+
+阶段六不重写 CUTLASS，而是把阶段五的 `.so` 挂到 TVM Relax：
+
+```text
+手写 Relax QDQ 图
+  -> match_qdq_pattern / annotate Composite
+  -> rewrite 为 call_dps_packed("cu_epilogue.qgemm_bias_gelu")
+  -> so_wrapper 加载 libcutlass_qgemm_bias_gelu_runtime.so
+```
+
+重点文件：
+
+- `06_tvm_cutlass_byoc/python/qdq_reference.py`
+- `06_tvm_cutlass_byoc/python/so_wrapper.py`
+- `06_tvm_cutlass_byoc/python/relax_patterns.py`
+- `06_tvm_cutlass_byoc/python/relax_pipeline.py`
+- `06_tvm_cutlass_byoc/docs/benchmarking_report.md`
+
+```bash
+./06_tvm_cutlass_byoc/scripts/setup_tvm.sh
+source 06_tvm_cutlass_byoc/.venv/bin/activate
+export CU_EPILOGUE_BUILD_DIR=$PWD/build
+export PYTHONPATH=06_tvm_cutlass_byoc/python:$PYTHONPATH
+export LD_LIBRARY_PATH=$PWD/build/05_qdq_fusion:$LD_LIBRARY_PATH
+pytest 06_tvm_cutlass_byoc/tests -q
+python 06_tvm_cutlass_byoc/scripts/bench_e2e.py --m 1 --n 4096 --k 4096
+```
+
+学习重点：与阶段五同语义；TVM 侧只做图匹配与外部调用；nsys 上仍是 RowSum+Gemm+ColSum（zp 修正），GELU/Q 在 Gemm epilogue 内。
+
 
 
 ## 8. 验证与排障清单
@@ -507,6 +539,7 @@ cd build && ctest -R stage5 --output-on-failure
 | 全量功能验证                  | `./scripts/build_all.sh`                                                       | 构建成功、静态脚本通过、`ctest`                             |
 | 只跑 CUDA correctness     | `cd build && ctest -R stage[1-3] --output-on-failure`                          | 数值误差和 CUDA runtime 是否正常                         |
 | 只跑 MLIR pass test       | `cd build && ctest -R 'stage4|stage5_qdq' --output-on-failure` | 阶段四/五的 IR 是否按预期改写 |
+| 阶段六 TVM BYOC           | `ctest -R stage6` 或 `pytest 06_tvm_cutlass_byoc/tests`（需 setup_tvm） | pattern / e2e / ≤1 LSB |
 | 阶段五 INT8 kernel         | `cd build && ctest -R stage5_qgemm --output-on-failure`                        | GPU 结果是否和 CPU 参考一致 |
 | 阶段五 Sm90 visitor        | `./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh`；`ctest -R stage5_visitor` | SFU 指令；cc&lt;90 时 correctness SKIP |
 | 验证 Tensor Core 指令       | `./02_cutlass_gemm/verify_mma_ptx.sh`                                          | `mma.sync.aligned.m8n8k4`、无 `ld.local/st.local` |
@@ -535,13 +568,13 @@ cd build && ctest -R stage5 --output-on-failure
 
 | 时间    | 任务                                                                                                         | 产出                                            |
 | ----- | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| 第 1 天 | 阅读 `README.md`、`docs/spec.md`、`docs/environment.md`，完成构建                                                   | 能解释五个阶段和当前环境约束                                |
+| 第 1 天 | 阅读 `README.md`、`docs/spec.md`、`docs/environment.md`，完成构建                                                   | 能解释六个阶段和当前环境约束                                |
 | 第 2 天 | 学阶段一，读 `sgemm_naive.cu` / `sgemm_tiled_smem.cu` / `matrix_ref.hpp`，跑 stage1 correctness                    | 能解释 naive 与 tiled 的访存差异                       |
 | 第 3 天 | 跑 `profile.sh`，看 `nsys`/`ncu` 指标                                                                           | 能读懂 SM throughput、memory throughput、occupancy |
 | 第 4 天 | 学阶段二：先弄清「纯 GEMM、不是融合」，对照 `cutlass_gemm.cu` 与 `fused_gemm_gelu.cu` 的差异；跑 `verify_mma_ptx.sh` 和大矩阵 benchmark | 能指出 epilogue 插槽，并解释 Tensor Core 与小/大矩阵差异      |
 | 第 5 天 | 学阶段三 functor 路径，读 `FastGeluPTX` 和 epilogue op，跑 SFU 验证；再对照 Sm90 visitor 文件与 `verify_sfu_visitor_sm90.sh`   | 能解释 functor vs visitor 与 SFU 误差验收             |
 | 第 6 天 | 学阶段四，读 pattern matching 和 external call emission，跑 stage4 test                                             | 能解释 MLIR IR 如何变成外部 fused call                 |
-| 第 7 天 | 学阶段五：对照 `qdq_pattern.mlir` 和三段 `qdq-opt` dump；跑 `ctest -R stage5`；对照 visitor 与 `verify_sfu_visitor_sm90.sh` | 能说出为什么量化图要在变成 memref 之前融合，以及 SIMT vs Sm90 visitor |
+| 第 7 天 | 学阶段五 + 阶段六：对照 `qdq_pattern.mlir` 与 Relax pattern；跑 stage5 / stage6 tests | 能对比 MLIR 与 TVM 两条挂接路径，并说明为何复用同一 `.so` |
 
 
 
@@ -558,4 +591,4 @@ cd build && ctest -R stage5 --output-on-failure
 
 ## 10. 阅读顺序建议
 
-先读 `common/matrix_ref.hpp`，理解 correctness 怎么比。然后按 `01 -> 02 -> 03 -> 04 -> 05` 读。不要先从 MLIR pass 开始：你会看懂 IR 怎么改，却不知道最后调用的 CUDA kernel 为什么对、为什么快。阶段五要在弄清阶段四「已经变成 memref 再融合」的局限之后再读。
+先读 `common/matrix_ref.hpp`，理解 correctness 怎么比。然后按 `01 -> 02 -> 03 -> 04 -> 05 -> 06` 读。不要先从 MLIR/TVM pass 开始：你会看懂 IR 怎么改，却不知道最后调用的 CUDA kernel 为什么对、为什么快。阶段五要在弄清阶段四「已经变成 memref 再融合」的局限之后再读；阶段六在弄清阶段五 `.so` ABI 之后再读。

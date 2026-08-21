@@ -9,4 +9,8 @@ compile_commands.json
 
 # nsys/ncu profiling artifacts (machine-specific binary reports)
 profile_reports/
+06_tvm_cutlass_byoc/docs/profile_artifacts/
 
+.venv/
+06_tvm_cutlass_byoc/.venv/
+Testing/Temporary/

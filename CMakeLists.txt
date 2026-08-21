@@ -11,6 +11,7 @@ project(CuEpilogue LANGUAGES C CXX)
 
 option(CU_EPILOGUE_ENABLE_CUDA "Enable CUDA stages (1-3): requires nvcc" ON)
 option(CU_EPILOGUE_ENABLE_MLIR "Enable MLIR stages (4-5): requires LLVM/MLIR" ON)
+option(CU_EPILOGUE_ENABLE_TVM "Enable stage 6 TVM Relax BYOC tests (requires python3+tvm)" OFF)
 option(CU_EPILOGUE_BUILD_TESTS "Build correctness / verification tests" ON)
 # Side-by-side CUTLASS 3.x Sm90 EVT / FusionCallbacks path (stage 3 Fast-GELU
 # and stage 5 INT8 QGEMM). Compiles those targets for sm_90a regardless of
@@ -35,6 +36,7 @@ endif()
 message(STATUS "CuEpilogue: target CUDA arch = sm_${CU_EPILOGUE_CUDA_ARCH}")
 message(STATUS "CuEpilogue: CUDA stages enabled = ${CU_EPILOGUE_ENABLE_CUDA}")
 message(STATUS "CuEpilogue: MLIR stages enabled = ${CU_EPILOGUE_ENABLE_MLIR}")
+message(STATUS "CuEpilogue: TVM stage 6 enabled = ${CU_EPILOGUE_ENABLE_TVM}")
 message(STATUS "CuEpilogue: Sm90 visitor path   = ${CU_EPILOGUE_ENABLE_SM90_VISITOR}")
 
 if(CU_EPILOGUE_ENABLE_CUDA)
@@ -64,4 +66,8 @@ endif()
 if(CU_EPILOGUE_ENABLE_MLIR)
   add_subdirectory(04_compiler_integration)
   add_subdirectory(05_qdq_fusion)
+endif()
+
+if(CU_EPILOGUE_ENABLE_TVM)
+  add_subdirectory(06_tvm_cutlass_byoc)
 endif()
