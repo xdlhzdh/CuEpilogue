@@ -127,9 +127,10 @@ def launch(
             raise ValueError(f"out shape {out.shape} != ({m}, {n})")
 
     if device_ptrs:
-        # Caller already passed device pointers packed as numpy object? Not used.
-        raise NotImplementedError("device_ptrs path reserved for TVM DLTensor binding")
-
+        # Prefer launch_device() with raw CUDA pointers (used by Relax packed func).
+        raise NotImplementedError(
+            "use launch_device(dA, dB, dBias, dD, ...) for TVM CUDA Tensor data_ptr()"
+        )
     # Host → device → kernel → host via cuda runtime.
     cudart = _load_cudart()
     dA = _cuda_malloc(cudart, A.nbytes)
@@ -271,3 +272,8 @@ def _cuda_memcpy_d2h(cudart: ctypes.CDLL, dst: np.ndarray, src: int) -> None:
 
 def _cuda_device_sync(cudart: ctypes.CDLL) -> None:
     _check(cudart, cudart.cudaDeviceSynchronize(), "cudaDeviceSynchronize")
+
+
+def device_synchronize() -> None:
+    """Block until outstanding CUDA work on the current device completes."""
+    _cuda_device_sync(_load_cudart())

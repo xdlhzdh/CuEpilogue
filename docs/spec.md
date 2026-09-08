@@ -75,6 +75,7 @@ struct FastGeluPTX {
   - **动态链接库封装:** 将上述 CUTLASS + PTX 算子编译为高度优化的 `.so` 动态库。
   - **代码生成 (Code Emission):** 拦截常规的 Lowering 管道（即不将其逐步 Lower 到 LLVM IR 的基础标量指令），在 Bufferization 分配好内存句柄后，直接 Emit 外部函数调用 (External Call) 指向该定制的 Fused Operator。
 - **验收标准:** 编译器前端输入 Fused GEMM + GELU 的计算图，能够成功编译并执行，端到端延迟对比基础指令展开下降 30% 以上。
+- **基准分档（延迟）:** （A）未融合 IR → CPU 标量 + `mlir-runner` JIT；（B）未融合 IR → MLIR 通用 GPU lowering → **AOT host ELF（内嵌 PTX）**；（C）融合后外部 CUTLASS 调用。spec 30% 验收可用 A vs C；B vs C 衡量融合相对编译器生成未融合 GPU 的收益（见 `04_compiler_integration/docs/aot_gpu_baseline.md`）。
 
 ### 阶段五：QDQ 算子融合（Tensor 高阶 Op → OSB → func.call）
 
@@ -95,10 +96,21 @@ struct FastGeluPTX {
 - **量化 / 激活语义:** 与阶段五相同（affine zp + SFU FastGELU 近似）；V100 走 SIMT 路径。
 - **实现细节:**
   - `06_tvm_cutlass_byoc/python/relax_patterns.py`：BlockBuilder 手写 Relax IR；dataflow walker 匹配 QDQ 链。
-  - `relax_pipeline.py`：annotate `Composite=cutlass.qgemm_bias_gelu` → rewrite 为 `call_dps_packed("cu_epilogue.qgemm_bias_gelu")`。
-  - `so_wrapper.py`：ctypes 加载阶段五 `.so`；packed func 内 launch。
+  - `relax_pipeline.py`：annotate `Composite=cutlass.qgemm_bias_gelu` → rewrite 为 `call_dps_packed("cu_epilogue.qgemm_bias_gelu")`；`build_vm` 默认 CUDA target（host llvm），无 GPU 时回退 llvm。
+  - `so_wrapper.py`：ctypes 加载阶段五 `.so`；CUDA Tensor 走 `launch_device`（device pointer），host 数组走 H2D 包装。
   - 构建：`-DCU_EPILOGUE_ENABLE_TVM=ON`；先 `06_tvm_cutlass_byoc/scripts/setup_tvm.sh` 安装 apache-tvm 到 `06_tvm_cutlass_byoc/.venv`。
 - **验收标准:** pytest M1–M3 通过（≤1 LSB，pattern 负例不匹配，e2e 单次 packed launch）；`bench_e2e.py` 相对 NumPy 未融合基线 ≥1.5×；nsys 确认无独立 DQ/GELU/Q compute kernel（与阶段五相同：RowSum+Gemm+ColSum）。报告见 `06_tvm_cutlass_byoc/docs/benchmarking_report.md`。
+
+### 阶段七：TVM DLight + MetaSchedule 混合调度
+
+- **目标:** 在 Relax LegalizeOps 之后的 TIR PrimFunc 上，按算子收益互斥选择 DLight 启发式调度或 MetaSchedule 搜索调优；BYOC（阶段六 CUTLASS）优先级最高，匹配后旁路本模块。
+- **约束:** 同一 PrimFunc 不可同时走 DLight 与 MetaSchedule；不改造 DLight / MetaSchedule 内部实现；不调优第三方库内部 tile。
+- **实现细节:**
+  - `07_tvm_hybrid_schedule/python/schedule_decision.py`：FLOPs / 形状 / 黑白名单 / `force_mode` 判定，属性 `cu_epilogue.schedule_strategy`。
+  - `dlight_scheduler.py`：子集 `ApplyDefaultSchedule`；`metaschedule_scheduler.py`：`MetaScheduleTuneIRMod(op_names=...)` + JSON DB 缓存 + `MetaScheduleApplyDatabase`。
+  - `byoc_stage6.py`：复用阶段六 `apply_pipeline`；`hybrid_pipeline.py` 主编排；`schedule_report.py` 输出 JSON/CSV。
+  - 构建：与阶段六相同，`-DCU_EPILOGUE_ENABLE_TVM=ON` 注册 `stage7_tvm_tests`。
+- **验收标准:** pytest M1（判定器）通过；M2 DLight 调度不崩溃；M3 MetaSchedule 冒烟需 CUDA（否则 SKIP）；M4 混合流水线与报表字段齐全。见 `07_tvm_hybrid_schedule/docs/architecture.md`。
 
 ## 4. 关键技术风险与排查路径 (Risk Mitigation)
 

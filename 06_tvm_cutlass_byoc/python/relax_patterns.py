@@ -1,12 +1,13 @@
 """Relax DFPattern for DQ + matmul + bias + FastGELU + Q (stage-5 semantics)."""
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import tvm
 from tvm import relax
 
 COMPOSITE_NAME = "cutlass.qgemm_bias_gelu"
+# Stage-5 FastGELU: x / (1 + exp2(c*x)) with c = -2.455492
 FAST_GELU_CONST = -2.455492
 
 
@@ -86,7 +87,8 @@ def build_negative_no_bias_module(m: int, n: int, k: int) -> tvm.IRModule:
     return bb.get()
 
 
-def _extract_scalar(expr) -> Optional[float]:
+def _extract_scalar(expr: relax.Expr) -> Optional[float]:
+    """Extract a scalar constant; returns None for non-scalars."""
     if isinstance(expr, relax.Constant):
         data = expr.data.numpy()
         if data.size == 1:
@@ -100,188 +102,258 @@ def _op_name(call: relax.Call) -> str:
     return str(call.op)
 
 
-def match_qdq_pattern(func: relax.Function) -> Optional[dict]:
-    """Walk dataflow and detect DQ-matmul-bias-FastGELU-Q."""
+def _same_expr(a: relax.Expr, b: relax.Expr) -> bool:
+    """SSA / structural identity check without depending on missing APIs."""
+    if a is b or a == b:
+        return True
+    try:
+        tvm.ir.assert_structural_equal(a, b)
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def match_qdq_pattern(
+    func: relax.Function, debug: bool = False
+) -> Optional[dict]:
+    """Reverse-trace DQ-matmul-bias-FastGELU-Q; independent of binding order.
+
+    Expected chain (stage-5 semantics)::
+
+        DQ(A), DQ(B) -> matmul -> +bias -> FastGELU
+          -> /scale_d + zp_d -> round -> clip [-> astype int8]
+    """
     if not isinstance(func.body, relax.SeqExpr):
+        if debug:
+            print("[match] fail: body not SeqExpr")
         return None
     blocks = func.body.blocks
     if len(blocks) != 1 or not isinstance(blocks[0], relax.DataflowBlock):
+        if debug:
+            print("[match] fail: not single DataflowBlock")
         return None
     bindings = list(blocks[0].bindings)
-    by_var = {}
+
+    by_var: Dict[relax.Var, relax.Expr] = {}
     for b in bindings:
         if isinstance(b, relax.VarBinding):
             by_var[b.var] = b.value
 
-    matmul_var = None
-    matmul_call = None
+    def resolve(expr: relax.Expr) -> relax.Expr:
+        while isinstance(expr, relax.Var) and expr in by_var:
+            expr = by_var[expr]
+        return expr
+
+    # ---- collect output quant clip nodes (clip or astype(clip)) ----
+    quant_candidates: list[tuple[relax.Var, relax.Call]] = []
     for b in bindings:
         if not isinstance(b, relax.VarBinding):
             continue
-        v = b.value
-        if isinstance(v, relax.Call) and _op_name(v) == "relax.matmul":
-            matmul_var = b.var
-            matmul_call = v
-            break
-    if matmul_call is None:
+        val = resolve(b.value)
+        if not isinstance(val, relax.Call):
+            continue
+        if _op_name(val) == "relax.clip":
+            quant_candidates.append((b.var, val))
+        elif _op_name(val) == "relax.astype":
+            inner = resolve(val.args[0])
+            if isinstance(inner, relax.Call) and _op_name(inner) == "relax.clip":
+                quant_candidates.append((b.var, inner))
+
+    if not quant_candidates:
+        if debug:
+            print("[match] fail: no quant clip node found")
         return None
 
-    bias_add_var = None
-    bias_arg = None
-    for b in bindings:
-        if not isinstance(b, relax.VarBinding):
-            continue
-        v = b.value
-        if (
-            isinstance(v, relax.Call)
-            and _op_name(v) == "relax.add"
-            and len(v.args) == 2
-            and (v.args[0] == matmul_var or v.args[1] == matmul_var)
-        ):
-            bias_add_var = b.var
-            bias_arg = v.args[1] if v.args[0] == matmul_var else v.args[0]
-            break
-    if bias_add_var is None:
-        return None
-
-    # FastGELU: divide(biased, add(power(2, mul(biased, c)), 1))
-    gelu_var = None
-    for b in bindings:
-        if not isinstance(b, relax.VarBinding):
-            continue
-        v = b.value
-        if not (isinstance(v, relax.Call) and _op_name(v) == "relax.divide"):
-            continue
-        if v.args[0] != bias_add_var:
-            continue
-        den = v.args[1]
-        den_val = by_var.get(den, den)
-        if not (isinstance(den_val, relax.Call) and _op_name(den_val) == "relax.add"):
-            continue
-        has_fast = False
-        for arg in den_val.args:
-            av = by_var.get(arg, arg)
-            if isinstance(av, relax.Call) and _op_name(av) == "relax.power":
-                # power(2, mul(...))
-                base = _extract_scalar(by_var.get(av.args[0], av.args[0]))
-                if base is None and isinstance(av.args[0], relax.Constant):
-                    base = _extract_scalar(av.args[0])
-                exp = by_var.get(av.args[1], av.args[1])
-                if base is not None and abs(base - 2.0) < 1e-6 and isinstance(
-                    exp, relax.Call
-                ) and _op_name(exp) == "relax.multiply":
-                    for ma in exp.args:
-                        sc = _extract_scalar(
-                            by_var.get(ma, ma) if isinstance(ma, relax.Var) else ma
-                        )
-                        if sc is None and isinstance(ma, relax.Constant):
-                            sc = _extract_scalar(ma)
-                        if sc is not None and abs(sc - FAST_GELU_CONST) < 1e-5:
-                            has_fast = True
-        if has_fast:
-            gelu_var = b.var
-            break
-    if gelu_var is None:
-        return None
-
-    has_quant = False
-    for b in bindings:
-        if not isinstance(b, relax.VarBinding):
-            continue
-        v = b.value
-        if isinstance(v, relax.Call) and _op_name(v) == "relax.clip":
-            has_quant = True
-            break
-        if isinstance(v, relax.Call) and _op_name(v) == "relax.astype":
-            src = by_var.get(v.args[0], v.args[0])
-            if isinstance(src, relax.Call) and _op_name(src) == "relax.clip":
-                has_quant = True
-                break
-    if not has_quant:
-        return None
-
-    def parse_dq(arg) -> Optional[Tuple[Any, float, float]]:
-        val = by_var.get(arg, arg)
+    def parse_dq(arg: relax.Expr) -> Optional[Tuple[relax.Expr, float, float]]:
+        """Parse (x - zp) * scale, optionally through astype."""
+        val = resolve(arg)
         if not (isinstance(val, relax.Call) and _op_name(val) == "relax.multiply"):
             return None
         sub = None
         scale = None
         for a in val.args:
-            av = by_var.get(a, a)
+            av = resolve(a)
             if isinstance(av, relax.Call) and _op_name(av) == "relax.subtract":
                 sub = av
             else:
-                scale = _extract_scalar(av if not isinstance(a, relax.Var) else by_var.get(a, a))
-                if scale is None:
-                    scale = _extract_scalar(a if isinstance(a, relax.Constant) else av)
+                scale = _extract_scalar(av)
         if sub is None or scale is None:
             return None
         zp = None
         src = None
         for a in sub.args:
-            av = by_var.get(a, a)
-            sc = _extract_scalar(av if not isinstance(a, relax.Var) else by_var.get(a, a))
-            if sc is None and isinstance(a, relax.Constant):
-                sc = _extract_scalar(a)
+            av = resolve(a)
+            sc = _extract_scalar(av)
             if sc is not None:
                 zp = sc
             else:
                 src = a
         if zp is None or src is None:
             return None
-        src_v = by_var.get(src, src)
+        src_v = resolve(src)
         if isinstance(src_v, relax.Call) and _op_name(src_v) == "relax.astype":
             src = src_v.args[0]
         return src, scale, zp
 
-    dq_a = parse_dq(matmul_call.args[0])
-    dq_b = parse_dq(matmul_call.args[1])
-    if dq_a is None or dq_b is None:
-        return None
-
-    scale_d, zp_d = None, None
-    for b in bindings:
-        if not isinstance(b, relax.VarBinding):
-            continue
-        v = b.value
-        if isinstance(v, relax.Call) and _op_name(v) == "relax.divide" and v.args[0] == gelu_var:
-            scale_d = _extract_scalar(by_var.get(v.args[1], v.args[1]))
-            if scale_d is None and isinstance(v.args[1], relax.Constant):
-                scale_d = _extract_scalar(v.args[1])
-        if isinstance(v, relax.Call) and _op_name(v) == "relax.add":
-            for a in v.args:
-                sc = _extract_scalar(by_var.get(a, a) if isinstance(a, relax.Var) else a)
-                if sc is not None and abs(sc - 0.0) > 0.5:
-                    # likely zp_d (integer-ish)
-                    if abs(sc - FAST_GELU_CONST) > 1.0:
-                        zp_d = sc
-
     params = list(func.params)
-    a_src, sa, za = dq_a
-    b_src, sb, zb = dq_b
 
-    def param_index(expr) -> Optional[int]:
-        for i, p in enumerate(params):
-            if expr == p:
-                return i
+    def param_index(e: relax.Expr) -> Optional[int]:
+        for idx, p in enumerate(params):
+            if _same_expr(e, p):
+                return idx
         return None
 
-    ia, ib, ibias = param_index(a_src), param_index(b_src), param_index(bias_arg)
-    if ia is None or ib is None or ibias is None:
-        return None
+    for _, clip_call in quant_candidates:
+        # Peel optional round: clip(round(q)) or clip(q)
+        quant_expr = resolve(clip_call.args[0])
+        if isinstance(quant_expr, relax.Call) and _op_name(quant_expr) == "relax.round":
+            quant_expr = resolve(quant_expr.args[0])
 
-    return {
-        "param_A": ia,
-        "param_B": ib,
-        "param_bias": ibias,
-        "scale_a": float(sa),
-        "zp_a": int(round(za)),
-        "scale_b": float(sb),
-        "zp_b": int(round(zb)),
-        "scale_d": float(scale_d) if scale_d is not None else 0.08,
-        "zp_d": int(round(zp_d)) if zp_d is not None else 0,
-        "matched": True,
-    }
+        # Quant: add(divide(gelu, scale_d), zp_d)  (either operand order)
+        if not (
+            isinstance(quant_expr, relax.Call)
+            and _op_name(quant_expr) == "relax.add"
+            and len(quant_expr.args) == 2
+        ):
+            if debug:
+                print("[match] fail: quant node is not binary add(gelu/scale, zp)")
+            continue
+
+        lhs, rhs = resolve(quant_expr.args[0]), resolve(quant_expr.args[1])
+
+        def as_quant_pair(
+            a: relax.Expr, b: relax.Expr
+        ) -> Optional[Tuple[relax.Expr, float, float]]:
+            # a = divide(gelu, scale), b = zp scalar
+            if not (isinstance(a, relax.Call) and _op_name(a) == "relax.divide"):
+                return None
+            zp = _extract_scalar(b)
+            scale = _extract_scalar(resolve(a.args[1]))
+            if zp is None or scale is None:
+                return None
+            return resolve(a.args[0]), scale, zp
+
+        parsed = as_quant_pair(lhs, rhs) or as_quant_pair(rhs, lhs)
+        if parsed is None:
+            if debug:
+                print("[match] fail: cannot split quant add into gelu/scale + zp")
+            continue
+        gelu_div_expr, scale_d, zp_d = parsed
+
+        if not (
+            isinstance(gelu_div_expr, relax.Call)
+            and _op_name(gelu_div_expr) == "relax.divide"
+        ):
+            if debug:
+                print("[match] fail: FastGELU root is not divide")
+            continue
+
+        # FastGELU: divide(bias_add, add(power(2, mul(x, c)), 1))
+        bias_add_expr = resolve(gelu_div_expr.args[0])
+        den_expr = resolve(gelu_div_expr.args[1])
+        if not (isinstance(den_expr, relax.Call) and _op_name(den_expr) == "relax.add"):
+            if debug:
+                print("[match] fail: gelu denominator not add")
+            continue
+
+        pow_term: Optional[relax.Call] = None
+        for arg in den_expr.args:
+            a_res = resolve(arg)
+            if isinstance(a_res, relax.Call) and _op_name(a_res) == "relax.power":
+                pow_term = a_res
+                break
+        if pow_term is None:
+            if debug:
+                print("[match] fail: cannot find power term in denominator")
+            continue
+
+        base_val = _extract_scalar(resolve(pow_term.args[0]))
+        exp_expr = resolve(pow_term.args[1])
+        if base_val is None or abs(base_val - 2.0) > 1e-6:
+            if debug:
+                print(f"[match] fail: power base != 2, got {base_val}")
+            continue
+        if not (
+            isinstance(exp_expr, relax.Call) and _op_name(exp_expr) == "relax.multiply"
+        ):
+            if debug:
+                print("[match] fail: power exp not multiply")
+            continue
+
+        c_const: Optional[float] = None
+        mul_input_x: Optional[relax.Expr] = None
+        for a in exp_expr.args:
+            av = resolve(a)
+            sc = _extract_scalar(av)
+            if sc is not None and abs(sc - FAST_GELU_CONST) < 1e-5:
+                c_const = sc
+            else:
+                mul_input_x = av
+        if c_const is None or mul_input_x is None:
+            if debug:
+                print("[match] fail: FastGELU constant missing")
+            continue
+        # DAG: multiply input must be the same bias_add used as gelu numerator
+        if not _same_expr(mul_input_x, bias_add_expr):
+            if debug:
+                print("[match] fail: FastGELU mul input != bias_add")
+            continue
+
+        if not (
+            isinstance(bias_add_expr, relax.Call)
+            and _op_name(bias_add_expr) == "relax.add"
+        ):
+            if debug:
+                print("[match] fail: gelu numerator not add(bias_add)")
+            continue
+
+        matmul_call: Optional[relax.Call] = None
+        bias_arg_expr: Optional[relax.Expr] = None
+        for arg in bias_add_expr.args:
+            av = resolve(arg)
+            if isinstance(av, relax.Call) and _op_name(av) == "relax.matmul":
+                matmul_call = av
+            else:
+                bias_arg_expr = arg
+        if matmul_call is None or bias_arg_expr is None:
+            if debug:
+                print("[match] fail: bias_add cannot split matmul / bias")
+            continue
+
+        dq_a = parse_dq(matmul_call.args[0])
+        dq_b = parse_dq(matmul_call.args[1])
+        if dq_a is None or dq_b is None:
+            if debug:
+                print("[match] fail: dq_a or dq_b parse failed")
+            continue
+        a_src, sa, za = dq_a
+        b_src, sb, zb = dq_b
+
+        ia = param_index(a_src)
+        ib = param_index(b_src)
+        ibias = param_index(bias_arg_expr)
+        if ia is None or ib is None or ibias is None:
+            if debug:
+                print(f"[match] fail: param index ia={ia}, ib={ib}, ibias={ibias}")
+            continue
+
+        return {
+            "param_A": ia,
+            "param_B": ib,
+            "param_bias": ibias,
+            "scale_a": float(sa),
+            "zp_a": int(round(za)),
+            "scale_b": float(sb),
+            "zp_b": int(round(zb)),
+            "scale_d": float(scale_d),
+            "zp_d": int(round(zp_d)),
+            "matched": True,
+        }
+
+    if debug:
+        print("[match] all quant candidates tried, no match")
+    return None
+
 
 
 def annotate_composite(mod: tvm.IRModule) -> Tuple[tvm.IRModule, Optional[dict]]:

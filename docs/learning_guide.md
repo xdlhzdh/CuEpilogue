@@ -34,6 +34,7 @@ D = GELU(A @ B)
 | `04_compiler_integration/` | 阶段四：在 memref 上匹配 GEMM+GELU，改成调用 `.so` |
 | `05_qdq_fusion/`           | 阶段五：在 tensor 上匹配量化图，bufferize 后再调用 INT8 kernel |
 | `06_tvm_cutlass_byoc/`     | 阶段六：TVM Relax 匹配同语义 QDQ 链，packed 调用阶段五 `.so` |
+| `07_tvm_hybrid_schedule/`  | 阶段七：DLight / MetaSchedule PrimFunc 级互斥分流（BYOC 优先） |
 | `scripts/`                 | 一键构建和功能验证                                                                                 |
 | `docs/`                    | spec、环境说明和本学习手册                                                                           |
 
@@ -529,7 +530,33 @@ python 06_tvm_cutlass_byoc/scripts/bench_e2e.py --m 1 --n 4096 --k 4096
 
 学习重点：与阶段五同语义；TVM 侧只做图匹配与外部调用；nsys 上仍是 RowSum+Gemm+ColSum（zp 修正），GELU/Q 在 Gemm epilogue 内。
 
+## 7.6 阶段七：DLight + MetaSchedule 混合调度
 
+阶段六解决「热点融合算子走外部 `.so`」；阶段七解决「剩下的 TIR PrimFunc 怎么选调度策略」。
+
+```text
+Relax 图
+  -> (可选) 阶段六 BYOC
+  -> LegalizeOps → PrimFunc 集合
+  -> 收益判定：DLIGHT | METASCHEDULE（互斥）
+  -> DLight 子集 / MetaScheduleTuneIRMod(op_names)
+  -> MetaScheduleApplyDatabase
+  -> schedule_report.json
+```
+
+重点文件：
+
+- `07_tvm_hybrid_schedule/python/schedule_decision.py`
+- `07_tvm_hybrid_schedule/python/hybrid_pipeline.py`
+- `07_tvm_hybrid_schedule/docs/architecture.md`
+
+```bash
+export PYTHONPATH=07_tvm_hybrid_schedule/python:06_tvm_cutlass_byoc/python:$PYTHONPATH
+pytest 07_tvm_hybrid_schedule/tests -q
+python 07_tvm_hybrid_schedule/python/build_and_run.py --kind hybrid --force-mode dlight
+```
+
+对照：阶段六 = BYOC 绑定已有 kernel；阶段七 = 原生 TIR tiling 策略分流，不重写 DLight/MS 内部。
 
 ## 8. 验证与排障清单
 
@@ -540,6 +567,7 @@ python 06_tvm_cutlass_byoc/scripts/bench_e2e.py --m 1 --n 4096 --k 4096
 | 只跑 CUDA correctness     | `cd build && ctest -R stage[1-3] --output-on-failure`                          | 数值误差和 CUDA runtime 是否正常                         |
 | 只跑 MLIR pass test       | `cd build && ctest -R 'stage4|stage5_qdq' --output-on-failure` | 阶段四/五的 IR 是否按预期改写 |
 | 阶段六 TVM BYOC           | `ctest -R stage6` 或 `pytest 06_tvm_cutlass_byoc/tests`（需 setup_tvm） | pattern / e2e / ≤1 LSB |
+| 阶段七混合调度              | `ctest -R stage7` 或 `pytest 07_tvm_hybrid_schedule/tests` | 判定互斥；M3 需 CUDA |
 | 阶段五 INT8 kernel         | `cd build && ctest -R stage5_qgemm --output-on-failure`                        | GPU 结果是否和 CPU 参考一致 |
 | 阶段五 Sm90 visitor        | `./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh`；`ctest -R stage5_visitor` | SFU 指令；cc&lt;90 时 correctness SKIP |
 | 验证 Tensor Core 指令       | `./02_cutlass_gemm/verify_mma_ptx.sh`                                          | `mma.sync.aligned.m8n8k4`、无 `ld.local/st.local` |
@@ -575,6 +603,7 @@ python 06_tvm_cutlass_byoc/scripts/bench_e2e.py --m 1 --n 4096 --k 4096
 | 第 5 天 | 学阶段三 functor 路径，读 `FastGeluPTX` 和 epilogue op，跑 SFU 验证；再对照 Sm90 visitor 文件与 `verify_sfu_visitor_sm90.sh`   | 能解释 functor vs visitor 与 SFU 误差验收             |
 | 第 6 天 | 学阶段四，读 pattern matching 和 external call emission，跑 stage4 test                                             | 能解释 MLIR IR 如何变成外部 fused call                 |
 | 第 7 天 | 学阶段五 + 阶段六：对照 `qdq_pattern.mlir` 与 Relax pattern；跑 stage5 / stage6 tests | 能对比 MLIR 与 TVM 两条挂接路径，并说明为何复用同一 `.so` |
+| 第 8 天 | 学阶段七：读 `architecture.md`，跑 `pytest 07_tvm_hybrid_schedule/tests`；对比 DLight-only / hybrid | 能说明 BYOC 优先、PrimFunc 策略互斥、MS 用 `op_names` 子集 |
 
 
 
@@ -591,4 +620,4 @@ python 06_tvm_cutlass_byoc/scripts/bench_e2e.py --m 1 --n 4096 --k 4096
 
 ## 10. 阅读顺序建议
 
-先读 `common/matrix_ref.hpp`，理解 correctness 怎么比。然后按 `01 -> 02 -> 03 -> 04 -> 05 -> 06` 读。不要先从 MLIR/TVM pass 开始：你会看懂 IR 怎么改，却不知道最后调用的 CUDA kernel 为什么对、为什么快。阶段五要在弄清阶段四「已经变成 memref 再融合」的局限之后再读；阶段六在弄清阶段五 `.so` ABI 之后再读。
+先读 `common/matrix_ref.hpp`，理解 correctness 怎么比。然后按 `01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07` 读。不要先从 MLIR/TVM pass 开始：你会看懂 IR 怎么改，却不知道最后调用的 CUDA kernel 为什么对、为什么快。阶段五要在弄清阶段四「已经变成 memref 再融合」的局限之后再读；阶段六在弄清阶段五 `.so` ABI 之后再读；阶段七在弄清阶段六 BYOC 与 Relax LegalizeOps 之后再读。

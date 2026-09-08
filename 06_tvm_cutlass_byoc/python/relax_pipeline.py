@@ -10,7 +10,7 @@ from relax_patterns import (
     COMPOSITE_NAME,
     annotate_composite,
 )
-from so_wrapper import launch
+from so_wrapper import device_synchronize, launch, launch_device
 
 _META = {
     "scale_a": 0.05,
@@ -35,9 +35,59 @@ def register_qgemm_meta(sa, za, sb, zb, sd, zd) -> None:
     )
 
 
+def _is_cuda_tensor(x) -> bool:
+    """True if *x* is a TVM Tensor/NDArray already resident on a CUDA device."""
+    if not hasattr(x, "data_ptr") or not hasattr(x, "device"):
+        return False
+    return "cuda" in str(x.device).lower()
+
+
+def default_target_and_device() -> Tuple[tvm.target.Target, tvm.runtime.Device]:
+    """Prefer CUDA (sm_70+ CUTLASS 2.x path); fall back to llvm/cpu only if no GPU."""
+    try:
+        if tvm.cuda(0).exist:
+            # Explicit host keeps Relax VM host codegen on llvm while device is CUDA —
+            # same split as stage-5 runtime (host driver + device CUTLASS .so).
+            return tvm.target.Target("cuda", host="llvm"), tvm.cuda(0)
+    except Exception:  # noqa: BLE001
+        pass
+    return tvm.target.Target("llvm"), tvm.cpu()
+
+
 @tvm.register_global_func("cu_epilogue.qgemm_bias_gelu", override=True)
 def _qgemm_packed(a, b, bias, out):
-    """Packed func: host NDArrays → fused CUTLASS .so (via so_wrapper)."""
+    """Packed func → stage-5 CUTLASS .so.
+
+    Fast path: CUDA Tensors pass device pointers straight into the C ABI
+    (no host round-trip), matching stage-5's device-pointer calling convention.
+    Slow path: CPU/host arrays go through so_wrapper.launch (H2D → kernel → D2H).
+    """
+    if (
+        _is_cuda_tensor(a)
+        and _is_cuda_tensor(b)
+        and _is_cuda_tensor(bias)
+        and _is_cuda_tensor(out)
+    ):
+        m, k = int(a.shape[0]), int(a.shape[1])
+        n = int(b.shape[1])
+        launch_device(
+            a.data_ptr(),
+            b.data_ptr(),
+            bias.data_ptr(),
+            out.data_ptr(),
+            m,
+            n,
+            k,
+            _META["scale_a"],
+            _META["zp_a"],
+            _META["scale_b"],
+            _META["zp_b"],
+            _META["scale_d"],
+            _META["zp_d"],
+        )
+        device_synchronize()
+        return out
+
     import numpy as np
 
     A = a.numpy() if hasattr(a, "numpy") else np.asarray(a)
@@ -59,7 +109,6 @@ def _qgemm_packed(a, b, bias, out):
     else:
         np.copyto(np.asarray(out), result)
     return out
-
 
 def fuse_and_partition(mod: tvm.IRModule) -> Tuple[tvm.IRModule, Optional[dict]]:
     return annotate_composite(mod)
@@ -137,15 +186,23 @@ def apply_pipeline(mod: tvm.IRModule) -> Tuple[tvm.IRModule, dict]:
     return rewritten, info
 
 
-def build_vm(mod: tvm.IRModule):
-    target = tvm.target.Target("llvm")
+def build_vm(
+    mod: tvm.IRModule,
+    target: Optional[tvm.target.Target] = None,
+    device: Optional[tvm.runtime.Device] = None,
+):
+    """Lower / build Relax VM for CUDA by default (llvm/cpu only if no GPU)."""
+    if target is None or device is None:
+        def_t, def_d = default_target_and_device()
+        target = target or def_t
+        device = device or def_d
     try:
         mod = relax.transform.LegalizeOps()(mod)
     except Exception:
         pass
     try:
         ex = relax.build(mod, target=target)
-        return relax.VirtualMachine(ex, tvm.cpu())
+        return relax.VirtualMachine(ex, device)
     except Exception:
         ex = relax.vm.build(mod, target=target)
-        return relax.VirtualMachine(ex, tvm.cpu())
+        return relax.VirtualMachine(ex, device)

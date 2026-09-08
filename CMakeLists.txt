@@ -11,7 +11,7 @@ project(CuEpilogue LANGUAGES C CXX)
 
 option(CU_EPILOGUE_ENABLE_CUDA "Enable CUDA stages (1-3): requires nvcc" ON)
 option(CU_EPILOGUE_ENABLE_MLIR "Enable MLIR stages (4-5): requires LLVM/MLIR" ON)
-option(CU_EPILOGUE_ENABLE_TVM "Enable stage 6 TVM Relax BYOC tests (requires python3+tvm)" OFF)
+option(CU_EPILOGUE_ENABLE_TVM "Enable stage 6/7 TVM Relax tests (BYOC + hybrid schedule; requires python3+tvm)" OFF)
 option(CU_EPILOGUE_BUILD_TESTS "Build correctness / verification tests" ON)
 # Side-by-side CUTLASS 3.x Sm90 EVT / FusionCallbacks path (stage 3 Fast-GELU
 # and stage 5 INT8 QGEMM). Compiles those targets for sm_90a regardless of
@@ -70,4 +70,5 @@ endif()
 
 if(CU_EPILOGUE_ENABLE_TVM)
   add_subdirectory(06_tvm_cutlass_byoc)
+  add_subdirectory(07_tvm_hybrid_schedule)
 endif()

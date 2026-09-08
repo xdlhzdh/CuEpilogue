@@ -4,7 +4,7 @@ Fused GEMM + Epilogue (Fast-GELU) 自定义算子开发与编译器集成 ——
 
 ## 项目主线
 
-本项目按六个阶段递进：先用手写 CUDA SGEMM 建立基线，再用 CUTLASS Tensor Core GEMM 提升吞吐，随后把 Fast-GELU 注入 CUTLASS Epilogue，再用 MLIR pass 把 memref 上的 `linalg.matmul + linalg.generic` 改写成对外部 CUTLASS fused kernel 的调用，再在 **Linalg-on-Tensor** 上把 DQ + Matmul + Bias + GELU + Q 收成高阶 Op，经 One-Shot Bufferize 后 lower 成 INT8 fused kernel 调用；阶段六在 **TVM Relax** 上复用同一 INT8 `.so`，完成 pattern / partition / packed 外部调用。
+本项目按七个阶段递进：先用手写 CUDA SGEMM 建立基线，再用 CUTLASS Tensor Core GEMM 提升吞吐，随后把 Fast-GELU 注入 CUTLASS Epilogue，再用 MLIR pass 把 memref 上的 `linalg.matmul + linalg.generic` 改写成对外部 CUTLASS fused kernel 的调用，再在 **Linalg-on-Tensor** 上把 DQ + Matmul + Bias + GELU + Q 收成高阶 Op，经 One-Shot Bufferize 后 lower 成 INT8 fused kernel 调用；阶段六在 **TVM Relax** 上复用同一 INT8 `.so`，完成 pattern / partition / packed 外部调用；阶段七在 Relax 下沉后的 TIR 上做 **DLight / MetaSchedule 算子级互斥分流**（BYOC 优先旁路）。
 
 | 阶段 | 目录 | 内容 |
 | --- | --- | --- |
@@ -14,8 +14,9 @@ Fused GEMM + Epilogue (Fast-GELU) 自定义算子开发与编译器集成 ——
 | 4 | `04_compiler_integration/` | MLIR 编译器后端集成：`fused-opt` 在 Bufferization 后把 `linalg.matmul`+`linalg.generic` 替换为对外部 CUTLASS 算子 `.so` 的 `call`（FP32 GEMM+GELU） |
 | 5 | `05_qdq_fusion/` | QDQ 整图融合：tensor 上匹配 DQ+Matmul+Bias+Fast-GELU+Q，插入 `cutlass.qgemm_bias_gelu`，OSB 后 lower 为 INT8 fused kernel；默认 SIMT，旁路 Sm90 visitor |
 | 6 | `06_tvm_cutlass_byoc/` | TVM Relax BYOC：复用阶段五 `.so`（affine zp + SFU FastGELU），Relax pattern → packed `cu_epilogue.qgemm_bias_gelu` |
+| 7 | `07_tvm_hybrid_schedule/` | TVM DLight + MetaSchedule 混合调度：PrimFunc 级互斥分流；复用阶段六 BYOC 作为最高优先级旁路 |
 
-六个阶段依次递进；1–5 均已实现，阶段六为并列的 TVM 编译器挂接路径。每个阶段的目的、运行方法和验收结果见下文「验收结果总览」。
+六个阶段依次递进；1–5 均已实现，阶段六、七为并列的 TVM 编译器挂接路径。每个阶段的目的、运行方法和验收结果见下文「验收结果总览」。
 
 ## 目录结构
 
@@ -30,6 +31,7 @@ CuEpilogue/
 ├── 04_compiler_integration/            # 阶段四：MLIR 编译器集成 + 端到端延迟 benchmark
 ├── 05_qdq_fusion/                      # 阶段五：QDQ tensor 融合 + INT8 fused kernel
 ├── 06_tvm_cutlass_byoc/                # 阶段六：TVM Relax BYOC（复用阶段五 .so）
+├── 07_tvm_hybrid_schedule/             # 阶段七：DLight / MetaSchedule 混合调度
 ├── scripts/setup_env.sh              # 安装 CUDA Toolkit
 ├── scripts/build_all.sh              # 一键配置+编译+功能验证
 └── docs/
@@ -47,7 +49,7 @@ sudo apt-get install -y cuda-toolkit-12-9   # V100 (sm_70) 需要 CUDA 12.x
 sudo update-alternatives --config cuda      # 确保默认 nvcc 指向 12.9
 ```
 
-阶段四、五需要 LLVM/MLIR（`find_package(MLIR CONFIG)` 能找到 `MLIRConfig.cmake`）；未安装时构建加 `-DCU_EPILOGUE_ENABLE_MLIR=OFF`。阶段六需要 Python TVM（`06_tvm_cutlass_byoc/scripts/setup_tvm.sh`），默认关闭：`-DCU_EPILOGUE_ENABLE_TVM=ON` 才会注册 `stage6_tvm_tests`。CMake 缺失可用 `pipx install cmake`。版本选择的原因见 [docs/environment.md](docs/environment.md)。
+阶段四、五需要 LLVM/MLIR（`find_package(MLIR CONFIG)` 能找到 `MLIRConfig.cmake`）；未安装时构建加 `-DCU_EPILOGUE_ENABLE_MLIR=OFF`。阶段六、七需要 Python TVM（`06_tvm_cutlass_byoc/scripts/setup_tvm.sh`），默认关闭：`-DCU_EPILOGUE_ENABLE_TVM=ON` 才会注册 `stage6_tvm_tests` / `stage7_tvm_tests`。CMake 缺失可用 `pipx install cmake`。版本选择的原因见 [docs/environment.md](docs/environment.md)。
 
 ### 2. 配置与编译
 
@@ -64,7 +66,7 @@ cmake --build build -j$(nproc)
 | `CU_EPILOGUE_ENABLE_CUDA` | `ON` | 是否构建阶段一~三（需要 `nvcc`，找不到会自动关闭并给出警告） |
 | `CU_EPILOGUE_ENABLE_SM90_VISITOR` | `ON` | 是否构建阶段三/五 Sm90 visitor 旁路（单独编 `sm_90a`；设备 correctness 需 Hopper） |
 | `CU_EPILOGUE_ENABLE_MLIR` | `ON` | 是否构建阶段四、五（需要 `find_package(MLIR)` 成功） |
-| `CU_EPILOGUE_ENABLE_TVM` | `OFF` | 是否注册阶段六 pytest（需要 venv 内 `apache-tvm`；缺省 SKIP） |
+| `CU_EPILOGUE_ENABLE_TVM` | `OFF` | 是否注册阶段六/七 pytest（需要 venv 内 `apache-tvm`；缺省 SKIP） |
 | `CU_EPILOGUE_BUILD_TESTS` | `ON` | 是否注册 `ctest` 测试 |
 
 ### 3. 一键跑完编译 + 功能验证
@@ -81,14 +83,15 @@ cmake --build build -j$(nproc)
 
 | 阶段 | 阶段目的 | 验收方法 | 当前结果 |
 | --- | --- | --- | --- |
-| 1. Native CUDA SGEMM baseline | 用 naive / shared-memory tiled SGEMM 建立正确性、性能和 profile 基线 | `cd build && ctest -R stage1_correctness_test --output-on-failure`；`./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness_test` | `ctest` 通过；`nsys` + `ncu --set full` 报告已产出。256³ 下 `SgemmTiledSmemKernel` SM 吞吐 **51.8%** of peak、显存吞吐 **50.5%**、Achieved Occupancy **49.8%** |
-| 2. CUTLASS Tensor Core GEMM | 用 CUTLASS FP16 Tensor Core GEMM 替代阶段一手写 FP32 kernel，并验证吞吐显著提升 | `cd build && ctest -R stage2_correctness_test --output-on-failure`；`./02_cutlass_gemm/verify_mma_ptx.sh`；`./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096` | `ctest` 通过；PTX 含 `mma.sync.aligned.m8n8k4`；4096³ 下阶段一 **3.05 TFLOPS**、阶段二 **36.27 TFLOPS**，**11.9× 加速** |
-| 3. Fast-GELU Epilogue | 把 Fast-GELU 融合进 CUTLASS Epilogue，GEMM 输出在寄存器路径中完成激活，避免中间张量落显存 | Functor：`ctest -R stage3_correctness_test`；`./03_fastgelu_epilogue/verify_sfu_sass.sh`。Visitor：`./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh`；`ctest -R stage3_visitor`（cc&lt;90 时 SKIP） | Functor：`ctest` 通过；PTX/SASS 含 SFU。Visitor：`sm_90a` 下 PTX 含 `ex2.approx`/`rcp.approx`，SASS 含 `MUFU.EX2`/`MUFU.RCP`；V100 上 correctness SKIP |
-| 4. MLIR compiler integration | 在 MLIR 后端识别 `linalg.matmul + linalg.generic`，改写为对外部 fused CUTLASS kernel 的调用 | `cd build && ctest -R stage4 --output-on-failure`；`./04_compiler_integration/benchmark_e2e.sh` | fusion pass 测试通过；20 次 fused 调用 **0.68ms**，未融合标量 CPU 循环 **148.3ms**，端到端延迟下降 **99.5%** |
-| 5. QDQ tensor fusion | 在 Linalg-on-Tensor 上融合 DQ+Matmul+Bias+Fast-GELU+Q 为 `cutlass.qgemm_bias_gelu`，OSB 后 lower 成 INT8 kernel 调用 | `cd build && ctest -R stage5 --output-on-failure`；visitor：`./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh`；`ctest -R stage5_visitor`（cc&lt;90 时 SKIP） | IR 三段通过；默认 SIMT kernel 与 CPU affine 参考一致。Visitor：`sm_90a` 下 PTX/SASS 含 SFU；V100 上 correctness SKIP |
+| 1. Native CUDA SGEMM baseline | 用 naive / shared-memory tiled SGEMM 建立正确性、性能和 profile 基线 | `cd build && ctest -R stage1_correctness_test --output-on-failure`；`./01_baseline_cuda/profile.sh build/01_baseline_cuda/stage1_correctness_test`；详见 [01 docs](01_baseline_cuda/docs/benchmarking_report.md) | `ctest` 通过；`nsys` + `ncu --set full` 报告已产出。256³ 下 `SgemmTiledSmemKernel` SM 吞吐 **51.8%** of peak、显存吞吐 **50.5%**、Achieved Occupancy **49.8%** |
+| 2. CUTLASS Tensor Core GEMM | 用 CUTLASS FP16 Tensor Core GEMM 替代阶段一手写 FP32 kernel，并验证吞吐显著提升 | `cd build && ctest -R stage2_correctness_test --output-on-failure`；`./02_cutlass_gemm/verify_mma_ptx.sh`；`./build/02_cutlass_gemm/bench_throughput_large 4096 4096 4096`；详见 [02 docs](02_cutlass_gemm/docs/benchmarking_report.md) | `ctest` 通过；PTX 含 `mma.sync.aligned.m8n8k4`；4096³ 下阶段一 **3.05 TFLOPS**、阶段二 **36.27 TFLOPS**，**11.9× 加速** |
+| 3. Fast-GELU Epilogue | 把 Fast-GELU 融合进 CUTLASS Epilogue，GEMM 输出在寄存器路径中完成激活，避免中间张量落显存 | Functor：`ctest -R stage3_correctness_test`；`./03_fastgelu_epilogue/verify_sfu_sass.sh`。Visitor：`./03_fastgelu_epilogue/verify_sfu_visitor_sm90.sh`；`ctest -R stage3_visitor`（cc&lt;90 时 SKIP）；详见 [03 docs](03_fastgelu_epilogue/docs/benchmarking_report.md) | Functor：`ctest` 通过；PTX/SASS 含 SFU。Visitor：`sm_90a` 下 PTX 含 `ex2.approx`/`rcp.approx`，SASS 含 `MUFU.EX2`/`MUFU.RCP`；V100 上 correctness SKIP |
+| 4. MLIR compiler integration | 在 MLIR 后端识别 `linalg.matmul + linalg.generic`，改写为对外部 fused CUTLASS kernel 的调用 | `cd build && ctest -R stage4 --output-on-failure`；`./04_compiler_integration/benchmark_e2e.sh`；详见 [04 docs](04_compiler_integration/docs/benchmarking_report.md) | fusion pass 测试通过；20 次 fused 调用 **0.68ms**，未融合标量 CPU 循环 **148.3ms**，端到端延迟下降 **99.5%** |
+| 5. QDQ tensor fusion | 在 Linalg-on-Tensor 上融合 DQ+Matmul+Bias+Fast-GELU+Q 为 `cutlass.qgemm_bias_gelu`，OSB 后 lower 成 INT8 kernel 调用 | `cd build && ctest -R stage5 --output-on-failure`；visitor：`./05_qdq_fusion/test/verify_sfu_visitor_sm90.sh`；`ctest -R stage5_visitor`（cc&lt;90 时 SKIP）；详见 [05 docs](05_qdq_fusion/docs/benchmarking_report.md) | IR 三段通过；默认 SIMT kernel 与 CPU affine 参考一致。Visitor：`sm_90a` 下 PTX/SASS 含 SFU；V100 上 correctness SKIP |
 | 6. TVM Relax BYOC | 复用阶段五 INT8 `.so`，Relax 匹配 QDQ 链并 rewrite 为 packed 外部调用 | `./06_tvm_cutlass_byoc/scripts/setup_tvm.sh`；`cmake -B build -DCU_EPILOGUE_ENABLE_TVM=ON`；然后 **`cd build && ctest -R stage6`**（或 `ctest --test-dir build -R stage6`）；也可直接 `pytest 06_tvm_cutlass_byoc/tests` | M1–M3 pytest 通过；`1×4096×4096` fused vs NumPy **11.2×**；详见 [06 docs](06_tvm_cutlass_byoc/docs/benchmarking_report.md) |
+| 7. Hybrid DLight/MS | PrimFunc 级互斥分流：DLight 启发式 vs MetaSchedule 搜索；BYOC 优先旁路 | `pytest 07_tvm_hybrid_schedule/tests`；或 `ctest -R stage7`（需 `ENABLE_TVM=ON`）；详见 [07 report](07_tvm_hybrid_schedule/docs/hybrid_schedule_report.md) | M1/M2/M4 无 GPU 可跑；M3 需 CUDA。见 [07 README](07_tvm_hybrid_schedule/README.md) |
 
-`ctest` 汇总：`cd build && ctest --output-on-failure`（含阶段五 IR + GPU kernel；阶段六在启用 TVM 且已 `setup_tvm.sh` 时跑 pytest，否则 SKIP）。
+`ctest` 汇总：`cd build && ctest --output-on-failure`（含阶段五 IR + GPU kernel；阶段六/七在启用 TVM 且已 `setup_tvm.sh` 时跑 pytest，否则 SKIP）。
 
 ### 阶段五：为什么不在 memref 上做 QDQ 融合？
 
@@ -126,14 +129,17 @@ cmake --build build -j$(nproc)
 
 所以验收靠 `stage3_correctness_test`（functor 数值）和 `verify_sfu_sass.sh`（PTX/SASS），外加旁路的 `verify_sfu_visitor_sm90.sh` / `stage3_visitor_correctness_test`（Hopper 或 SKIP）。和「分开做 GEMM + GELU」比快慢，放到阶段四；阶段四默认仍调用 functor 路径的 fused kernel。
 
-### 阶段四：0.68 ms 和 148 ms 分别测了什么？
+### 阶段四：延迟 benchmark 三档基线
 
-| 对比项 | 实际在测什么 |
-| --- | --- |
-| **融合路径（0.68 ms / 20 次）** | 直接反复调用阶段三的 CUTLASS Fast-GELU kernel——和编译器融合后要调用的 CUDA 代码一模一样 |
-| **未融合路径（148 ms / 20 次）** | MLIR 把 `matmul + gelu` 展开成标量循环，在 CPU 上 JIT 执行——对应 spec 的「基础指令展开」基线，故意代表「没融合时的慢路径」 |
+| 档 | 耗时（V100，128³×20） | 实际在测什么 |
+| --- | --- | --- |
+| **A. 未融合 CPU JIT** | **148 ms** | `bench_unfused.mlir` → 标量循环 → `mlir-runner` CPU JIT（spec「基础指令展开」） |
+| **B. 未融合 GPU AOT** | _(需 NVPTX MLIR)_ | 同一 IR → Linalg GPU lowering → **内嵌 PTX 的 host ELF**（见 [aot_gpu_baseline.md](04_compiler_integration/docs/aot_gpu_baseline.md)） |
+| **C. 融合 CUTLASS** | **0.68 ms** | `bench_fused_e2e` 直接调阶段三 kernel（与 `func.call @cutlass_fused_gemm_gelu` 目标一致） |
 
-融合侧为什么没走 `mlir-runner`？MLIR 的 bare-pointer 调用约定不支持动态形状 memref 的函数声明，而融合 pass 为了适配不同矩阵尺寸，签名写成了 `memref<?x?xf32>`。融合 pass 改 IR 对不对，已由 `stage4_fuse_gemm_gelu_test` 单独验证；这个 benchmark 只回答一个问题：**融合后的 GPU kernel 比展开循环快多少**。
+spec 30% 验收用 **A vs C**（99.5%）。**B vs C** 才是「融合外部调用 vs 编译器生成未融合 GPU」的公平对比；本机 MLIR 未编入 NVPTX，B 档需重装/重编 LLVM 后运行 `scripts/build_aot_gpu_baseline.sh`。
+
+融合侧为什么没走 `mlir-runner`？MLIR 的 bare-pointer 调用约定不支持动态形状 memref 的函数声明，而融合 pass 为了适配不同矩阵尺寸，签名写成了 `memref<?x?xf32>`。融合 pass 改 IR 对不对，已由 `stage4_fuse_gemm_gelu_test` 单独验证。
 
 未融合侧已用双倍迭代次数确认耗时线性增长，排除「循环被编译器提前算完」的假象。
 
@@ -157,6 +163,7 @@ cmake --build build -j$(nproc)
 - **阶段四：编译器认出「矩阵乘 + GELU」并合成一次调用**（`04_compiler_integration/`）：`FuseGemmGeluPattern.cpp` 在 MLIR 里找这样的模式——`linalg.matmul` 的输出**只**被一个逐元素激活（GELU）消费，且两者已经 bufferize 成内存上的张量。匹配成功就把两个算子删掉，改成调用外部函数 `@cutlass_fused_gemm_gelu`。`EmitExternalCall.cpp` 在生成调用前检查张量是不是 2D、是不是 f32、布局对不对，不对就直接报错，避免生成错误的 C 接口。`runtime/cutlass_fused_gemm_gelu_c_api.cu` 把阶段三的 kernel 包成这个外部函数，打进 `libcutlass_fused_gemm_gelu_runtime.so`，供 MLIR 生成的代码链接调用。
 - **阶段五：量化图在 tensor 上整段融合**（`05_qdq_fusion/`）：`-fuse-qdq-qgemm-bias-gelu` 匹配 DQ + `linalg.matmul` + bias + Fast-GELU + Q，插入 `cutlass.qgemm_bias_gelu`；One-Shot Bufferize 把它变成 memref 黑盒；`-lower-cutlass-qgemm-to-call` 发出 `@cutlass_qgemm_bias_gelu`。默认 INT8 kernel 与 C ABI 在 `kernels/qgemm_bias_gelu.cu` 和 `runtime/`；Sm90 visitor 在 `kernels/qgemm_bias_gelu_visitor_sm90.cu`。
 - **阶段六：TVM Relax 挂同一 `.so`**（`06_tvm_cutlass_byoc/`）：不重写 CUTLASS。手写 Relax QDQ 图，`relax_patterns.py` 认出「反量化→GEMM→bias→FastGELU→再量化」后打上 `cutlass.qgemm_bias_gelu`；`relax_pipeline.py` 改写成 `call_dps_packed("cu_epilogue.qgemm_bias_gelu")`；`so_wrapper.py` 用 ctypes 调阶段五的 `libcutlass_qgemm_bias_gelu_runtime.so`。一次 C 调用内部仍是 RowSum + Gemm + ColSum（与阶段五相同）。跑法见 [`06_tvm_cutlass_byoc/README.md`](06_tvm_cutlass_byoc/README.md)，数据见 [`benchmarking_report.md`](06_tvm_cutlass_byoc/docs/benchmarking_report.md)。
+- **阶段七：DLight / MetaSchedule 混合调度**（`07_tvm_hybrid_schedule/`）：LegalizeOps 之后对每个 PrimFunc 做收益判定，互斥打上 `DLIGHT` 或 `METASCHEDULE`；子集调用 DLight `ApplyDefaultSchedule` 或 `MetaScheduleTuneIRMod(op_names=...)`，最后 `MetaScheduleApplyDatabase`。阶段六 BYOC 优先旁路。见 [`07 README`](07_tvm_hybrid_schedule/README.md)。
 
 ## 关键风险与当前状态（对应 spec 第 4 节）
 

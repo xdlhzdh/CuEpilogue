@@ -1,0 +1,32 @@
+# Stage-7 hybrid DLight / MetaSchedule decision config.
+
+# Global force: "auto" | "dlight" | "metaschedule"
+force_mode = "auto"
+
+# FLOPs above this → MetaSchedule (matmul 2*M*N*K heuristic)
+flops_threshold = 50_000_000
+
+# Placeholder for future runtime profiler (not used by static analyzer yet)
+hotspot_ratio_threshold = 0.10
+
+# Op names forced to MetaSchedule (substring match on PrimFunc GlobalVar name)
+whitelist = []
+
+# Op names forced to DLight
+blacklist = []
+
+# Irregular shapes that prefer MetaSchedule: list of "MxNxK" or "MxN" strings
+irregular_shapes = []
+
+# Static hotspot op-name substrings (compile-time stand-in for profiler)
+hotspot_ops = []
+
+# MetaSchedule smoke / default trials
+max_trials_global = 16
+max_trials_per_task = 16
+
+# Apply stage-6 CUTLASS BYOC when the module looks like a QDQ chain
+enable_byoc_stage6 = true
+
+# Default work_dir for MS JSON database (relative to CWD or absolute)
+work_dir = "docs/work_dirs/default"

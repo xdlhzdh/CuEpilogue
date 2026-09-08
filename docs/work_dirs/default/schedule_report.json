@@ -1,0 +1,56 @@
+{
+  "compile_seconds": 0.02268841600016458,
+  "work_dir": "docs/work_dirs/default",
+  "operators": [
+    {
+      "name": "fused_add_relu",
+      "shapes": [
+        [
+          64,
+          32
+        ],
+        [
+          64,
+          32
+        ],
+        [
+          64,
+          32
+        ]
+      ],
+      "flops": 2048.0,
+      "strategy": "DLIGHT",
+      "reason": "category=elementwise",
+      "ms_trials": null,
+      "tune_seconds": null,
+      "best_latency_ms": null,
+      "ms_cache_hit": null,
+      "dlight_skipped_search": true
+    },
+    {
+      "name": "matmul",
+      "shapes": [
+        [
+          64,
+          256
+        ],
+        [
+          64,
+          256
+        ],
+        [
+          64,
+          256
+        ]
+      ],
+      "flops": 8388608.0,
+      "strategy": "DLIGHT",
+      "reason": "default (flops=8388608<=50000000)",
+      "ms_trials": null,
+      "tune_seconds": null,
+      "best_latency_ms": null,
+      "ms_cache_hit": null,
+      "dlight_skipped_search": true
+    }
+  ]
+}

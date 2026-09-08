@@ -6,11 +6,16 @@ from typing import Tuple
 
 import numpy as np
 import tvm
-from tvm import relax
+from tvm import runtime as rt
 
 from qdq_reference import make_test_inputs, reference_qgemm_bias_gelu
 from relax_patterns import build_qdq_relax_module
-from relax_pipeline import apply_pipeline, build_vm, register_qgemm_meta
+from relax_pipeline import (
+    apply_pipeline,
+    build_vm,
+    default_target_and_device,
+    register_qgemm_meta,
+)
 from so_wrapper import launch, launch_count, reset_launch_count
 
 
@@ -35,12 +40,13 @@ def run_e2e(
     )
 
     reset_launch_count()
-    # Prefer VM path; fall back to direct packed call if build fails.
+    # Prefer CUDA VM path (device tensors → CUTLASS .so); fall back to direct launch.
     try:
-        vm = build_vm(rewritten)
-        a_t = tvm.nd.array(A)
-        b_t = tvm.nd.array(B)
-        bias_t = tvm.nd.array(bias)
+        target, device = default_target_and_device()
+        vm = build_vm(rewritten, target=target, device=device)
+        a_t = rt.tensor(A, device=device)
+        b_t = rt.tensor(B, device=device)
+        bias_t = rt.tensor(bias, device=device)
         out_t = vm["main"](a_t, b_t, bias_t)
         out = out_t.numpy()
     except Exception as exc:  # noqa: BLE001
@@ -49,7 +55,6 @@ def run_e2e(
         out = launch(A, B, bias, sa, za, sb, zb, sd, zd)
 
     return out, ref, launch_count()
-
 
 def main():
     p = argparse.ArgumentParser(description="Stage-6 TVM + CUTLASS QGEMM e2e")

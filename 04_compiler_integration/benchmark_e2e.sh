@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
-# Stage 4 end-to-end latency benchmark (spec 3.4 acceptance: the fused
-# external-call path should be >=30% faster than "基础指令展开" - the
-# plain scalar loop nest MLIR would produce WITHOUT the --fuse-gemm-gelu
-# pass).
+# Stage 4 end-to-end latency benchmark (spec 3.4 acceptance).
 #
-# "Fused" side: bench_fused_e2e (built by CMake) calls directly into the
-# same CUTLASS kernel that libcutlass_fused_gemm_gelu_runtime.so wraps
-# behind the C symbol the compiler pass emits a call to (see
-# test/bench_fused_e2e.cu for why this bypasses fused-opt/mlir-runner).
+# Tiers:
+#   A - Unfused: fused-opt (no --fuse-gemm-gelu) -> scalar CPU loops -> mlir-runner JIT
+#   B - Unfused GPU AOT: linalg -> gpu.launch -> embedded PTX host ELF (optional; see
+#       docs/aot_gpu_baseline.md and scripts/build_aot_gpu_baseline.sh)
+#   C - Fused: bench_fused_e2e -> CUTLASS Fast-GELU kernel (external-call target)
 #
-# "Unfused" side: test/bench_unfused.mlir, lowered by fused-opt WITHOUT
-# --fuse-gemm-gelu (plain linalg.matmul + linalg.generic ->
-# --convert-linalg-to-loops -> scalar CPU loops), executed via mlir-runner.
+# Spec ">=30% faster than 基础指令展开" is checked as A vs C. B vs C is the fairer
+# compiler baseline when NVPTX-enabled MLIR is available.
 #
 # Usage: ./04_compiler_integration/benchmark_e2e.sh [path/to/build/dir]
 set -euo pipefail
@@ -68,9 +65,35 @@ rm -f "$LOWERED"
 UNFUSED_MS="$(awk -v s="$UNFUSED_SEC" 'BEGIN { printf "%.6f", s * 1000 }')"
 echo "20 iterations, total: ${UNFUSED_MS} ms"
 
+AOT_GPU_BIN="$SCRIPT_DIR/docs/work_dirs/aot_gpu_baseline/bench_aot_gpu_unfused"
+AOT_GPU_MS=""
+if [[ -x "$AOT_GPU_BIN" ]]; then
+  echo
+  echo "== GPU AOT unfused baseline: linalg -> embedded PTX host ELF (see docs/aot_gpu_baseline.md) =="
+  AOT_OUT="$("$AOT_GPU_BIN")"
+  # bench_unfused.mlir prints seconds via @printF64 (same as mlir-runner).
+  AOT_GPU_MS="$(echo "$AOT_OUT" | awk '/^[0-9]/ { printf "%.6f", $1 * 1000; exit }')"
+  echo "20 iterations, total: ${AOT_GPU_MS} ms"
+else
+  echo
+  echo "== GPU AOT unfused baseline: skipped (not built) =="
+  echo "Build: ./04_compiler_integration/scripts/build_aot_gpu_baseline.sh"
+  echo "       (requires MLIR/LLVM with NVPTX; run check_aot_gpu_prereqs.sh)"
+fi
+
 echo
 echo "== Comparison =="
-awk -v fused="$FUSED_MS" -v unfused="$UNFUSED_MS" 'BEGIN {
-  drop = (unfused - fused) / unfused * 100.0;
-  printf "fused:   %.4f ms (20 iters)\nunfused: %.4f ms (20 iters)\nlatency change: %.1f%% (positive = fused is faster; spec 3.4 target: >= 30%%)\n", fused, unfused, drop;
-}'
+if [[ -n "$AOT_GPU_MS" ]]; then
+  awk -v fused="$FUSED_MS" -v cpu="$UNFUSED_MS" -v gpu="$AOT_GPU_MS" 'BEGIN {
+    drop_cpu = (cpu - fused) / cpu * 100.0;
+    drop_gpu = (gpu - fused) / gpu * 100.0;
+    printf "C fused CUTLASS:     %.4f ms (20 iters)\n", fused;
+    printf "A unfused CPU JIT:   %.4f ms (20 iters)  -> vs C: %.1f%% faster (spec >= 30%%)\n", cpu, drop_cpu;
+    printf "B unfused GPU AOT:   %.4f ms (20 iters)  -> vs C: %.1f%% faster\n", gpu, drop_gpu;
+  }'
+else
+  awk -v fused="$FUSED_MS" -v unfused="$UNFUSED_MS" 'BEGIN {
+    drop = (unfused - fused) / unfused * 100.0;
+    printf "C fused CUTLASS:   %.4f ms (20 iters)\nA unfused CPU JIT: %.4f ms (20 iters)\nlatency change (A vs C): %.1f%% (positive = fused is faster; spec 3.4 target: >= 30%%)\n", fused, unfused, drop;
+  }'
+fi

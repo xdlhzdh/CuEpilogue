@@ -1,0 +1,3 @@
+name,shapes,flops,strategy,reason,ms_trials,tune_seconds,best_latency_ms,ms_cache_hit,dlight_skipped_search
+fused_add_relu,"[[64, 32], [64, 32], [64, 32]]",2048.0,DLIGHT,category=elementwise,,,,,True
+matmul,"[[64, 256], [64, 256], [64, 256]]",8388608.0,DLIGHT,default (flops=8388608<=50000000),,,,,True

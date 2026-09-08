@@ -20,9 +20,9 @@
 | CUDA Toolkit | **12.9.86**，`/usr/local/cuda` 已通过 `update-alternatives` 指向此版本 | 必须是 12.x，见下方说明 |
 | CMake | 4.3.4（`pipx install cmake`） | |
 | Nsight Systems / Compute | `nsys` 2025.1.3；`ncu` 装了两个版本：`2025.2.1`（能用）和 `2026.2.1`（与 535 驱动不兼容，见下） | `ncu` 还需要 `sudo`，见下 |
-| LLVM / MLIR | 23.0.0git，`mlir-opt` / `llvm-config` / `MLIRConfig.cmake` 均在 `/usr/local` | 阶段四、五依赖 |
+| LLVM / MLIR | 23.0.0git，`mlir-opt` / `llvm-config` / `MLIRConfig.cmake` 均在 `/usr/local` | 阶段四、五依赖；**当前构建仅含 `X86;RISCV`，无 NVPTX**（见下） |
 | CUTLASS | v3.5.1，CMake `FetchContent` 自动拉取 | |
-| Apache TVM | 0.26.0（`06_tvm_cutlass_byoc/.venv`，`06_tvm_cutlass_byoc/scripts/setup_tvm.sh`） | 阶段六；默认 `CU_EPILOGUE_ENABLE_TVM=OFF` |
+| Apache TVM | 0.26.0（`06_tvm_cutlass_byoc/.venv`，`06_tvm_cutlass_byoc/scripts/setup_tvm.sh`） | 阶段六 BYOC + 阶段七混合调度；默认 `CU_EPILOGUE_ENABLE_TVM=OFF`。阶段七 API：`tvm.s_tir.dlight`、`relax.transform.MetaScheduleTuneIRMod` / `ApplyDatabase`；MetaSchedule 实测需 CUDA 与可写 `work_dir` |
 
 ### 为什么编译必须用 CUDA 12.x
 
@@ -46,6 +46,23 @@ sudo update-alternatives --config cuda   # 选择 /usr/local/cuda-12.9
 2. **性能计数器权限**：驱动默认 `RmProfilingAdminOnly=1`，普通用户不能读 GPU 性能计数器，必须对 `ncu` 本身使用 `sudo`，否则报 `ERR_NVGPUCTRPERM`。
 
 `01_baseline_cuda/profile.sh` 已经把“探测兼容版本 + sudo”自动化，直接跑脚本即可；细节见 README「`ncu` 排障记录」。
+
+### MLIR GPU AOT 基线（阶段四 / 五）
+
+阶段四「未融合 GPU AOT」路径（`linalg` → `gpu.launch` → 内嵌 PTX 的 host ELF）依赖：
+
+- `mlir-opt --gpu-lower-to-nvvm-pipeline` / `gpu-module-to-binary`
+- LLVM **NVPTX** target（`llvm-config --targets-built` 须含 `NVPTX`）
+
+本机当前：
+
+```bash
+llvm-config --targets-built   # RISCV X86  — 无 NVPTX
+```
+
+因此 `04_compiler_integration/scripts/build_aot_gpu_baseline.sh` 会在 NVVM 步失败。修复：自研 LLVM/MLIR 时设置 `LLVM_TARGETS_TO_BUILD="X86;NVPTX"`（或安装已启用 GPU target 的 MLIR 包），再运行 `check_aot_gpu_prereqs.sh`。
+
+设计说明：[04_compiler_integration/docs/aot_gpu_baseline.md](../04_compiler_integration/docs/aot_gpu_baseline.md)。
 
 ### 架构相关配置（Volta / V100）
 
