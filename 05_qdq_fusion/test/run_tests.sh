@@ -38,7 +38,6 @@ check_absent() {
     echo "PASS: absent: $1"
   fi
 }
-
 echo "== stage1: fuse-qdq-qgemm-bias-gelu =="
 "$QDQ_OPT" "$INPUT" --fuse-qdq-qgemm-bias-gelu --canonicalize > "$OUT"
 cat "$OUT"
@@ -64,6 +63,16 @@ check_present "call @cutlass_qgemm_bias_gelu"
 check_present "func.func private @cutlass_qgemm_bias_gelu"
 check_absent "cutlass.qgemm_bias_gelu ins"
 check_absent "linalg.matmul"
+check_present "!llvm.ptr"
+
+echo "== stage4: lower to LLVM, external signature must match the C API =="
+"$QDQ_OPT" "$INPUT" --fuse-qdq-qgemm-bias-gelu \
+  --one-shot-bufferize="$BUFFERIZE_OPTS" \
+  --lower-cutlass-qgemm-to-call \
+  --finalize-memref-to-llvm --convert-arith-to-llvm --convert-func-to-llvm \
+  --reconcile-unrealized-casts > "$OUT"
+check_present "llvm.func @cutlass_qgemm_bias_gelu(!llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, f32, i32, f32, i32, f32, i32)"
+check_present "llvm.call @cutlass_qgemm_bias_gelu"
 
 rm -f "$OUT"
 if [[ "$fail" == "0" ]]; then

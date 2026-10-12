@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -13,14 +14,6 @@ using namespace cu_epilogue;
 
 namespace {
 constexpr char kExternalSymbol[] = "cutlass_qgemm_bias_gelu";
-
-Type dynI8Matrix(MLIRContext *ctx) {
-  return MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic},
-                         IntegerType::get(ctx, 8));
-}
-Type dynF32Vec(MLIRContext *ctx) {
-  return MemRefType::get({ShapedType::kDynamic}, Float32Type::get(ctx));
-}
 
 LogicalResult validateI8Matrix(Operation *op, Value v, const char *role) {
   auto ty = dyn_cast<MemRefType>(v.getType());
@@ -48,18 +41,28 @@ LogicalResult validateF32Vec(Operation *op, Value v, const char *role) {
   return success();
 }
 
-Value castMemref(OpBuilder &b, Location loc, Value v, Type canonical) {
-  if (v.getType() == canonical)
-    return v;
-  return memref::CastOp::create(b, loc, canonical, v);
+// Address of element 0. The validators guarantee an identity layout, whose
+// offset is statically 0, so the aligned base pointer is enough. The pointer
+// does not keep the buffer alive: buffer deallocation must run before this
+// lowering (its deallocs then already follow the fused op), not after.
+Value toBarePointer(OpBuilder &b, Location loc, Value memref) {
+  Value index = memref::ExtractAlignedPointerAsIndexOp::create(b, loc, memref);
+  Value i64 = arith::IndexCastOp::create(b, loc, b.getI64Type(), index);
+  return LLVM::IntToPtrOp::create(
+      b, loc, LLVM::LLVMPointerType::get(b.getContext()), i64);
 }
 
+// Matches the runtime C API (runtime/cutlass_qgemm_bias_gelu_c_api.cu).
+// Buffers are passed as `!llvm.ptr`, not memref: a memref argument lowers to
+// an unpacked descriptor under the default LLVM calling convention, and the
+// bare-pointer convention rejects dynamically shaped memrefs. The C API only
+// accepts device pointers; placing the buffers is the caller's job.
 func::FuncOp getOrInsertDecl(OpBuilder &builder, ModuleOp module, Location loc) {
   if (auto existing = module.lookupSymbol<func::FuncOp>(kExternalSymbol))
     return existing;
-  MLIRContext *ctx = builder.getContext();
+  Type ptrTy = LLVM::LLVMPointerType::get(builder.getContext());
   auto fnTy = builder.getFunctionType(
-      {dynI8Matrix(ctx), dynI8Matrix(ctx), dynF32Vec(ctx), dynI8Matrix(ctx),
+      {ptrTy, ptrTy, ptrTy, ptrTy,
        builder.getI64Type(), builder.getI64Type(), builder.getI64Type(),
        builder.getF32Type(), builder.getI32Type(), builder.getF32Type(),
        builder.getI32Type(), builder.getF32Type(), builder.getI32Type()},
@@ -84,7 +87,7 @@ public:
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<func::FuncDialect, arith::ArithDialect,
-                    memref::MemRefDialect, CutlassDialect>();
+                    memref::MemRefDialect, LLVM::LLVMDialect, CutlassDialect>();
   }
 
   void runOnOperation() override {
@@ -122,14 +125,12 @@ public:
       Value nI64 = arith::IndexCastOp::create(rewriter, loc, i64Ty, n);
       Value kI64 = arith::IndexCastOp::create(rewriter, loc, i64Ty, k);
 
-      Type aTy = dynI8Matrix(rewriter.getContext());
-      Type biasTy = dynF32Vec(rewriter.getContext());
       func::CallOp::create(
           rewriter, loc, fn,
-          ValueRange{castMemref(rewriter, loc, op.getA(), aTy),
-                     castMemref(rewriter, loc, op.getB(), aTy),
-                     castMemref(rewriter, loc, op.getBias(), biasTy),
-                     castMemref(rewriter, loc, op.getD(), aTy), mI64, nI64,
+          ValueRange{toBarePointer(rewriter, loc, op.getA()),
+                     toBarePointer(rewriter, loc, op.getB()),
+                     toBarePointer(rewriter, loc, op.getBias()),
+                     toBarePointer(rewriter, loc, op.getD()), mI64, nI64,
                      kI64, op.getScaleA(), op.getZpA(), op.getScaleB(),
                      op.getZpB(), op.getScaleD(), op.getZpD()});
       rewriter.eraseOp(op);

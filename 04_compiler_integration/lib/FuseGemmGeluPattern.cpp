@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -17,10 +18,9 @@ using namespace mlir;
 namespace cu_epilogue {
 namespace {
 
-/// True if `v` is an f32/f64 arith.constant whose value is within `tol` of
-/// `expected`. Used to recognize Fast-GELU's magic coefficient and the
-/// additive `1.0` in `1 + 2^(...)` without depending on bit-identical APFloat
-/// encodings after bufferize/canonicalize.
+/// `v` 是 f32/f64 的 arith.constant，且与 `expected` 的差不超过 `tol` 时返回
+/// true。用于识别 Fast-GELU 的魔数系数和 `1 + 2^(...)` 中的 `1.0`；经过
+/// bufferize/canonicalize 后 APFloat 编码不一定逐位相同，所以按容差比较。
 bool isFloatConstantNear(Value v, double expected, double tol = 1e-4) {
   APFloat ap(0.0);
   if (!matchPattern(v, m_ConstantFloat(&ap)))
@@ -28,101 +28,15 @@ bool isFloatConstantNear(Value v, double expected, double tol = 1e-4) {
   return std::abs(ap.convertToDouble() - expected) <= tol;
 }
 
-/// If `v` is an f32/f64 arith.constant, write it to `out` and return true.
-bool matchStaticFloat(Value v, float &out) {
-  APFloat ap(0.0);
-  if (!matchPattern(v, m_ConstantFloat(&ap)))
-    return false;
-
-  // APFloat::convert is in-place and returns opStatus, not a new APFloat.
-  bool losesInfo = false;
-  ap.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &losesInfo);
-  out = ap.convertToFloat();
-  return true;
-}
-
-/// Peel an optional leading scale: `x` or `arith.mulf(x, alpha)` /
-/// `arith.mulf(alpha, x)`. Returns the unscaled value and writes a static
-/// `alpha` (defaults to 1.0 when no mulf is present). Dynamic (non-constant)
-/// scales are rejected — after fusion the generic region is erased, so the
-/// scale must be materializable as a host-side float constant.
-FailureOr<Value> peelStaticAlpha(Value v, Value expectedInput, float &alpha) {
-  alpha = 1.0f;
-  if (v == expectedInput)
-    return v;
-
-  auto mul = v.getDefiningOp<arith::MulFOp>();
-  if (!mul)
-    return failure();
-
-  Value lhs = mul.getLhs();
-  Value rhs = mul.getRhs();
-  if (lhs == expectedInput && matchStaticFloat(rhs, alpha))
-    return lhs;
-  if (rhs == expectedInput && matchStaticFloat(lhs, alpha))
-    return rhs;
-  return failure();
-}
-
-/// True when `v` is `base` (scale = 1) or `arith.mulf(base, cst)` / `mulf(cst, base)`.
-bool matchScaledOperand(Value v, Value base, float &scale) {
-  if (!base)
-    return false;
-  if (v == base) {
-    scale = 1.0f;
-    return true;
-  }
-  if (auto mul = v.getDefiningOp<arith::MulFOp>()) {
-    if (mul.getLhs() == base && matchStaticFloat(mul.getRhs(), scale))
-      return true;
-    if (mul.getRhs() == base && matchStaticFloat(mul.getLhs(), scale))
-      return true;
-  }
-  return false;
-}
-
-/// Recognize `linear` as `alpha * blockInput + beta * blockInit` with static
-/// coefficients (defaults alpha=1, beta=0 when terms are absent).
-bool extractAlphaBetaFromLinear(Value linear, Value blockInput, Value blockInit,
-                                float &alpha, float &beta) {
-  alpha = 1.0f;
-  beta = 0.0f;
-
-  if (matchScaledOperand(linear, blockInput, alpha)) {
-    beta = 0.0f;
-    return true;
-  }
-
-  auto add = linear.getDefiningOp<arith::AddFOp>();
-  if (!add || !blockInit)
-    return false;
-
-  float lhsIn = 1.0f, rhsIn = 1.0f, lhsInit = 1.0f, rhsInit = 1.0f;
-  bool hasLhsIn = matchScaledOperand(add.getLhs(), blockInput, lhsIn);
-  bool hasRhsIn = matchScaledOperand(add.getRhs(), blockInput, rhsIn);
-  bool hasLhsInit = matchScaledOperand(add.getLhs(), blockInit, lhsInit);
-  bool hasRhsInit = matchScaledOperand(add.getRhs(), blockInit, rhsInit);
-
-  if (hasLhsIn && hasRhsInit && !hasLhsInit && !hasRhsIn) {
-    alpha = lhsIn;
-    beta = rhsInit;
-    return true;
-  }
-  if (hasRhsIn && hasLhsInit && !hasRhsInit && !hasLhsIn) {
-    alpha = rhsIn;
-    beta = lhsInit;
-    return true;
-  }
-  return false;
-}
-
-/// Spec 3.3 Fast-GELU algebraic form used by fuse_pattern.mlir:
-///   GELU(x) ~= x / (1 + 2^(-2.455492 * x))
-/// Recognized as:
-///   yield(divf(x, addf(exp2(mulf(x, c)), 1)))   with c ≈ -2.455492
-/// where `x` is the linear epilogue value `alpha * in + beta * init`.
-bool matchFastGeluAlgebraic(Value yielded, Value blockInput, Value blockInit,
-                            float &alpha, float &beta) {
+/// 识别规格 3.3 的 Fast-GELU 代数形式：
+///   GELU(x) ≈ x / (1 + 2^(-2.455492 * x))
+/// 对应 IR：
+///   yield(divf(x, addf(exp2(mulf(x, c)), 1)))   其中 c ≈ -2.455492
+/// 系数 -2.455492 写死在 CUTLASS kernel 的 epilogue 里，这里只做校验、不提取
+/// 任何参数。`x` 必须就是 block 参数 `%in`（matmul 结果的一个元素）：带缩放
+/// （`%in * cst`）或混入 `%out` 的写法都不融合，因为外部调用固定传
+/// alpha = 1.0、beta = 0.0。
+bool matchFastGeluAlgebraic(Value yielded, Value blockInput) {
   auto div = yielded.getDefiningOp<arith::DivFOp>();
   if (!div)
     return false;
@@ -150,7 +64,7 @@ bool matchFastGeluAlgebraic(Value yielded, Value blockInput, Value blockInit,
   if (!mul)
     return false;
 
-  // One side of the mul must be the Fast-GELU constant; the other is `x`.
+  // mulf 的一侧必须是 Fast-GELU 常数，另一侧是 `x`。
   Value x;
   if (isFloatConstantNear(mul.getRhs(), -2.455492))
     x = mul.getLhs();
@@ -159,209 +73,89 @@ bool matchFastGeluAlgebraic(Value yielded, Value blockInput, Value blockInit,
   else
     return false;
 
-  // Fast-GELU is `x / (1 + 2^(c*x))` — numerator must be the same `x`.
-  if (numer != x)
-    return false;
-
-  return extractAlphaBetaFromLinear(x, blockInput, blockInit, alpha, beta);
+  // Fast-GELU 是 `x / (1 + 2^(c*x))`：分子必须是同一个 `x`，且就是 `%in`。
+  return numer == x && x == blockInput;
 }
 
-/// Classic erf-based GELU: somewhere in the def-use chain of `yielded` there
-/// is a `math.erf` whose operand ultimately depends on the block input.
-/// We accept this as GELU without reconstructing the full
-/// `0.5*x*(1+erf(x/sqrt(2)))` tree (canonicalization may rearrange it).
-bool matchErfBasedGelu(Value yielded, Value blockInput, float &alpha) {
-  alpha = 1.0f;
-  bool sawErf = false;
-  bool dependsOnInput = false;
-
-  SmallVector<Value, 8> vals{yielded};
-  DenseSet<Value> seenVals;
-  while (!vals.empty()) {
-    Value cur = vals.pop_back_val();
-    if (!seenVals.insert(cur).second)
-      continue;
-    if (cur == blockInput)
-      dependsOnInput = true;
-
-    if (auto mul = cur.getDefiningOp<arith::MulFOp>()) {
-      float maybeAlpha = 1.0f;
-      if (mul.getLhs() == blockInput && matchStaticFloat(mul.getRhs(), maybeAlpha))
-        alpha = maybeAlpha;
-      else if (mul.getRhs() == blockInput &&
-               matchStaticFloat(mul.getLhs(), maybeAlpha))
-        alpha = maybeAlpha;
-    }
-
-    if (auto erf = cur.getDefiningOp<math::ErfOp>()) {
-      sawErf = true;
-      vals.push_back(erf.getOperand());
-      continue;
-    }
-
-    Operation *def = cur.getDefiningOp();
-    if (!def)
-      continue;
-    for (Value operand : def->getOperands())
-      vals.push_back(operand);
-  }
-
-  return sawErf && dependsOnInput;
-}
-
-/// Tanh-based GELU approximation: body contains `math.tanh` whose result
-/// feeds into the yielded value and depends on the block input.
-bool matchTanhBasedGelu(Value yielded, Value blockInput, float &alpha) {
-  alpha = 1.0f;
-  bool sawTanh = false;
-  bool dependsOnInput = false;
-
-  SmallVector<Value, 8> vals{yielded};
-  DenseSet<Value> seenVals;
-  while (!vals.empty()) {
-    Value cur = vals.pop_back_val();
-    if (!seenVals.insert(cur).second)
-      continue;
-    if (cur == blockInput)
-      dependsOnInput = true;
-
-    if (auto mul = cur.getDefiningOp<arith::MulFOp>()) {
-      float maybeAlpha = 1.0f;
-      if (mul.getLhs() == blockInput && matchStaticFloat(mul.getRhs(), maybeAlpha))
-        alpha = maybeAlpha;
-      else if (mul.getRhs() == blockInput &&
-               matchStaticFloat(mul.getLhs(), maybeAlpha))
-        alpha = maybeAlpha;
-    }
-
-    if (auto tanh = cur.getDefiningOp<math::TanhOp>()) {
-      sawTanh = true;
-      vals.push_back(tanh.getOperand());
-      continue;
-    }
-
-    Operation *def = cur.getDefiningOp();
-    if (!def)
-      continue;
-    for (Value operand : def->getOperands())
-      vals.push_back(operand);
-  }
-
-  return sawTanh && dependsOnInput;
-}
-
-/// Forward-compatible: a single `math.gelu` (or similarly named) op on the
-/// (optionally scaled) block input. Not present in all MLIR versions.
-bool matchNamedGeluOp(Value yielded, Value blockInput, float &alpha) {
-  Operation *def = yielded.getDefiningOp();
-  if (!def)
-    return false;
-  StringRef name = def->getName().getStringRef();
-  if (name != "math.gelu" && name != "math.GELU")
-    return false;
-  if (def->getNumOperands() != 1)
-    return false;
-  return succeeded(peelStaticAlpha(def->getOperand(0), blockInput, alpha));
-}
-
-/// Optional epilogue term `+ beta * init` folded into the same generic.
-/// When the bufferized init block-arg appears in an `arith.addf` either bare
-/// (beta = 1) or as `mulf(init, beta_cst)`, record that static coefficient.
-/// Dynamic coefficients are ignored — the region is erased on rewrite.
-void tryExtractBetaFromAdd(Value blockInit, float &beta) {
-  beta = 0.0f;
-  if (!blockInit)
-    return;
-
-  for (Operation *user : blockInit.getUsers()) {
-    auto add = dyn_cast<arith::AddFOp>(user);
-    if (!add)
-      continue;
-
-    if (add.getLhs() == blockInit || add.getRhs() == blockInit) {
-      beta = 1.0f;
-      return;
-    }
-  }
-
-  // Also accept `addf(x, mulf(init, beta))` where the mul's result is an
-  // operand of some addf that uses blockInit indirectly via the mul.
-  for (Operation *user : blockInit.getUsers()) {
-    auto mul = dyn_cast<arith::MulFOp>(user);
-    if (!mul)
-      continue;
-    float b = 0.0f;
-    if (mul.getLhs() == blockInit && matchStaticFloat(mul.getRhs(), b)) {
-      // Confirm the scaled init feeds an addf (linear combination).
-      for (Operation *mulUser : mul->getUsers()) {
-        if (isa<arith::AddFOp>(mulUser)) {
-          beta = b;
-          return;
-        }
-      }
-    }
-    if (mul.getRhs() == blockInit && matchStaticFloat(mul.getLhs(), b)) {
-      for (Operation *mulUser : mul->getUsers()) {
-        if (isa<arith::AddFOp>(mulUser)) {
-          beta = b;
-          return;
-        }
-      }
-    }
-  }
-}
-
-/// Inspect the `linalg.generic` region and decide whether it is a recognized
-/// GELU (Fast-GELU / erf / tanh / named math.gelu). On success, writes the
-/// extracted static `alpha` / `beta` (defaults 1.0 / 0.0).
-bool matchGeluBody(linalg::GenericOp generic, float &alpha, float &beta) {
-  alpha = 1.0f;
-  beta = 0.0f;
-
+/// 判断 `linalg.generic` 的 region 是否正好是 CUTLASS kernel 实现的
+/// Fast-GELU，即 D = FastGELU(A @ B)。
+///
+/// 只接受 Fast-GELU：erf / tanh 形式的 GELU 不融合，否则会被替换成 kernel
+/// 的 Fast-GELU 近似，改变数值结果。
+///
+/// 下面是 tensor 上的示例（test/fuse_pattern.mlir）。本 pass 运行在
+/// One-Shot Bufferize 之后，届时 ins/outs 变成 memref、generic 没有返回值，
+/// region 内容不变。#map = affine_map<(i, j) -> (i, j)>。
+///
+///   %r = linalg.generic {indexing_maps = [#map, #map],
+///                        iterator_types = ["parallel", "parallel"]}
+///       ins(%mm : tensor<128x128xf32>) outs(%empty : tensor<128x128xf32>) {
+///   ^bb0(%in: f32, %out: f32):
+///     %c = arith.constant -2.455492 : f32
+///     %one = arith.constant 1.0 : f32
+///     %t = arith.mulf %in, %c : f32
+///     %e = math.exp2 %t : f32
+///     %d = arith.addf %e, %one : f32
+///     %y = arith.divf %in, %d : f32
+///     linalg.yield %y : f32
+///   } -> tensor<128x128xf32>
+bool matchGeluBody(linalg::GenericOp generic) {
   Region &region = generic.getRegion();
   if (!region.hasOneBlock())
     return false;
   Block &block = region.front();
-  // Bufferized unary elementwise generic: bb args are (input, init/out).
+  // bufferize 后的一元逐元素 generic：block 参数为 (input, init/out)。
   if (block.getNumArguments() < 1)
     return false;
-
-  Value blockInput = block.getArgument(0);
-  Value blockInit =
-      block.getNumArguments() >= 2 ? block.getArgument(1) : Value();
 
   auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
   if (!yield || yield.getNumOperands() != 1)
     return false;
-  Value yielded = yield.getOperand(0);
 
-  // Prefer the project's exact Fast-GELU lowering; then erf / tanh / named.
-  bool matchedFastGelu =
-      matchFastGeluAlgebraic(yielded, blockInput, blockInit, alpha, beta);
-  bool isGelu = matchedFastGelu || matchNamedGeluOp(yielded, blockInput, alpha) ||
-                matchErfBasedGelu(yielded, blockInput, alpha) ||
-                matchTanhBasedGelu(yielded, blockInput, alpha);
-  if (!isGelu)
-    return false;
-
-  // Fast-GELU path already extracted beta from the linear epilogue; erf/tanh
-  // paths may still fold a bare `+ init` term via the legacy beta helper.
-  if (!matchedFastGelu)
-    tryExtractBetaFromAdd(blockInit, beta);
-  return true;
+  return matchFastGeluAlgebraic(yield.getOperand(0), block.getArgument(0));
 }
 
-/// Structural gate + semantic GELU recognition.
-/// Returns true only when `generic` is a bufferized, all-parallel, identity-
-/// map unary elementwise op that reads `expectedInput` *and* whose region
-/// implements a recognized GELU. Writes extracted alpha/beta on success.
-bool isElementwiseGeluOf(linalg::GenericOp generic, Value expectedInput,
-                         float &alpha, float &beta) {
+/// 融合 kernel 从零开始计算 `A @ B`，而 `linalg.matmul` 是在输出 buffer
+/// 原有内容上累加。只有当该 buffer 是函数内的 `memref.alloc`、在 matmul 之前
+/// 被 `linalg.fill 0.0` 清零、且没有其他观察者时，融合才等价。返回需要与
+/// matmul 一起删除的 `linalg.fill`，不满足条件则返回空。
+linalg::FillOp findZeroInitOfLocalAcc(linalg::MatmulOp matmul,
+                                      linalg::GenericOp activation) {
+  Value acc = matmul.getOutputs()[0];
+  if (!acc.getDefiningOp<memref::AllocOp>())
+    return linalg::FillOp();
+
+  Block *block = matmul->getBlock();
+  if (activation->getBlock() != block ||
+      !matmul->isBeforeInBlock(activation) ||
+      activation.getOutputs()[0] == acc)
+    return linalg::FillOp();
+
+  linalg::FillOp fill;
+  for (Operation *user : acc.getUsers()) {
+    if (user == matmul.getOperation() || user == activation.getOperation() ||
+        isa<memref::DeallocOp>(user))
+      continue;
+    auto candidate = dyn_cast<linalg::FillOp>(user);
+    if (!candidate || fill || candidate.getOutputs()[0] != acc ||
+        candidate->getBlock() != block ||
+        !candidate->isBeforeInBlock(matmul) ||
+        !matchPattern(candidate.getInputs()[0], m_AnyZeroFloat()))
+      return linalg::FillOp();
+    fill = candidate;
+  }
+  return fill;
+}
+
+/// 结构检查 + GELU 语义识别。
+/// 仅当 `generic` 是 bufferize 后、全 parallel、identity map 的一元逐元素
+/// op，读取 `expectedInput`，且 region 是 Fast-GELU 时返回 true。
+bool isElementwiseGeluOf(linalg::GenericOp generic, Value expectedInput) {
   if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1)
     return false;
   if (generic.getInputs()[0] != expectedInput)
     return false;
-  // Tensor-semantics generics still have SSA results; require bufferized form.
+  // tensor 语义的 generic 仍有 SSA 结果；这里要求已 bufferize 的形式。
   if (generic.getNumResults() != 0)
     return false;
 
@@ -373,8 +167,8 @@ bool isElementwiseGeluOf(linalg::GenericOp generic, Value expectedInput,
     if (!map.isIdentity())
       return false;
 
-  // Element type must be a floating-point type the runtime can accept
-  // (emit path currently requires f32 memrefs; reject early here too).
+  // 元素类型必须是 runtime 能接受的浮点类型（emit 路径目前只支持 f32
+  // memref，这里提前拒绝）。
   auto inType = dyn_cast<MemRefType>(expectedInput.getType());
   if (!inType || !inType.getElementType().isF32())
     return false;
@@ -384,11 +178,11 @@ bool isElementwiseGeluOf(linalg::GenericOp generic, Value expectedInput,
   if (!inType.getLayout().isIdentity() || !outType.getLayout().isIdentity())
     return false;
 
-  return matchGeluBody(generic, alpha, beta);
+  return matchGeluBody(generic);
 }
 
 class FuseGemmGeluPass
-    : public PassWrapper<FuseGemmGeluPass, OperationPass<func::FuncOp>> {
+    : public PassWrapper<FuseGemmGeluPass, OperationPass<ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseGemmGeluPass)
 
@@ -402,24 +196,25 @@ public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<func::FuncDialect, linalg::LinalgDialect,
                     arith::ArithDialect, math::MathDialect,
-                    memref::MemRefDialect>();
+                    memref::MemRefDialect, LLVM::LLVMDialect>();
   }
 
+  // 作用在 module 上：改写时要往 module 里插入外部函数声明，函数级 pass
+  // 不允许修改 module。
   void runOnOperation() override {
-    func::FuncOp func = getOperation();
+    ModuleOp module = getOperation();
 
     SmallVector<FusedGemmGeluMatch> matches;
-    func.walk([&](linalg::MatmulOp matmulOp) {
-      // Only memref-based (post-bufferization) matmuls are eligible: a
-      // tensor-semantics matmul still has a result; a bufferized one writes
-      // in-place to its `outs` operand and has none.
+    module.walk([&](linalg::MatmulOp matmulOp) {
+      // 只处理 memref 形式（bufferize 之后）的 matmul：tensor 语义的 matmul
+      // 还有返回值；bufferize 后的 matmul 原地写入 `outs`，没有返回值。
       if (matmulOp.getNumResults() != 0)
         return;
       if (matmulOp.getNumDpsInputs() != 2 || matmulOp.getNumDpsInits() != 1)
         return;
 
-      // Early type/layout check on matmul operands — keeps the rewriter from
-      // discovering a "match" that emitExternalFusedCall would later reject.
+      // 提前检查 matmul 操作数的类型/布局，避免匹配成功后又被
+      // emitExternalFusedCall 拒绝。
       for (Value operand :
            {matmulOp.getInputs()[0], matmulOp.getInputs()[1],
             matmulOp.getOutputs()[0]}) {
@@ -430,27 +225,24 @@ public:
 
       Value matmulOutput = matmulOp.getOutputs()[0];
       linalg::GenericOp matchedActivation;
-      float alpha = 1.0f;
-      float beta = 0.0f;
-      int otherUses = 0;
       for (Operation *user : matmulOutput.getUsers()) {
-        if (user == matmulOp.getOperation())
+        auto generic = dyn_cast<linalg::GenericOp>(user);
+        if (!generic || !isElementwiseGeluOf(generic, matmulOutput))
           continue;
-        ++otherUses;
-        if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
-          float a = 1.0f, b = 0.0f;
-          if (isElementwiseGeluOf(generic, matmulOutput, a, b)) {
-            matchedActivation = generic;
-            alpha = a;
-            beta = b;
-          }
-        }
+        if (matchedActivation)
+          return;
+        matchedActivation = generic;
       }
+      if (!matchedActivation)
+        return;
 
-      // Require the matmul output to be consumed *only* by the matched GELU —
-      // otherwise erasing the matmul would change other observers' values.
-      if (otherUses == 1 && matchedActivation)
-        matches.push_back({matmulOp, matchedActivation, alpha, beta});
+      // 累加 buffer 的其他使用者都在这里检查过，删除 matmul 不会改变任何
+      // 其他 op 观察到的值。
+      linalg::FillOp zeroInit =
+          findZeroInitOfLocalAcc(matmulOp, matchedActivation);
+      if (!zeroInit)
+        return;
+      matches.push_back({matmulOp, matchedActivation, zeroInit});
     });
 
     if (matches.empty())

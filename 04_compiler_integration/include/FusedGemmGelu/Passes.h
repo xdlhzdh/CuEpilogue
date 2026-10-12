@@ -3,10 +3,10 @@
 // Stage 4 - AI compiler backend integration (spec 3.4).
 //
 // Declares the `-fuse-gemm-gelu` pass: run *after* bufferization, it
-// recognizes a bufferized `linalg.matmul` whose sole consumer is an
-// elementwise `linalg.generic` whose *region body* implements a recognized
-// GELU (Fast-GELU / erf / tanh / named math.gelu — not an arbitrary unary
-// op). Both ops are replaced with a single `func.call` to
+// recognizes a bufferized `linalg.matmul` into a zero-filled local buffer
+// whose sole consumer is an elementwise `linalg.generic` whose *region body*
+// implements Fast-GELU (erf / tanh GELU and other unary ops are left
+// unfused). Both ops are replaced with a single `func.call` to
 // `@cutlass_fused_gemm_gelu` (Stage 2/3 CUTLASS kernel).
 #include "mlir/Pass/Pass.h"
 

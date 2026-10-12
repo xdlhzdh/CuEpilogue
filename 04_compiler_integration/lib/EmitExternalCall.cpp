@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -13,31 +14,43 @@ namespace cu_epilogue {
 namespace {
 constexpr char kExternalSymbol[] = "cutlass_fused_gemm_gelu";
 
-// The runtime C API (04_compiler_integration/runtime) speaks row-major
-// contiguous FP32 buffers; this is the canonical MLIR-side signature every
-// matched call site is cast to before calling.
-Type CanonicalMemRefType(MLIRContext *ctx) {
-  return MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic},
-                        Float32Type::get(ctx));
-}
-
+// Matches the runtime C API (runtime/cutlass_fused_gemm_gelu_c_api.cu):
+//   (const float *A, const float *B, float *D, int64_t M, int64_t N,
+//    int64_t K, float alpha, float beta)
+// Buffers are passed as `!llvm.ptr`, not memref: a memref argument lowers to
+// an unpacked descriptor under the default LLVM calling convention, and the
+// bare-pointer convention rejects dynamically shaped memrefs. The C API only
+// accepts device pointers; placing the buffers is the caller's job.
 func::FuncOp getOrInsertExternalDecl(OpBuilder &builder, ModuleOp module,
                                      Location loc) {
   if (auto existing = module.lookupSymbol<func::FuncOp>(kExternalSymbol))
     return existing;
 
   MLIRContext *ctx = builder.getContext();
-  Type memrefTy = CanonicalMemRefType(ctx);
+  Type ptrTy = LLVM::LLVMPointerType::get(ctx);
   Type i64Ty = builder.getI64Type();
   Type f32Ty = builder.getF32Type();
   auto funcType = builder.getFunctionType(
-      {memrefTy, memrefTy, memrefTy, i64Ty, i64Ty, i64Ty, f32Ty, f32Ty}, {});
+      {ptrTy, ptrTy, ptrTy, i64Ty, i64Ty, i64Ty, f32Ty, f32Ty}, {});
 
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(module.getBody());
   auto funcOp = func::FuncOp::create(builder, loc, kExternalSymbol, funcType);
   funcOp.setPrivate(); // declaration only - no body means "extern" on lowering
   return funcOp;
+}
+
+// Address of element [0, 0]. validateOperand guarantees an identity layout,
+// whose offset is statically 0, so the aligned base pointer is enough. The
+// pointer does not keep the buffer alive: buffer deallocation must run before
+// this rewrite (its deallocs then already follow the matched ops), not after.
+Value toBarePointer(OpBuilder &builder, Location loc, Value memref) {
+  Value index =
+      memref::ExtractAlignedPointerAsIndexOp::create(builder, loc, memref);
+  Value i64 =
+      arith::IndexCastOp::create(builder, loc, builder.getI64Type(), index);
+  return LLVM::IntToPtrOp::create(
+      builder, loc, LLVM::LLVMPointerType::get(builder.getContext()), i64);
 }
 
 // Rejects memrefs the runtime C API cannot safely accept: anything other
@@ -64,18 +77,17 @@ LogicalResult validateOperand(Operation *op, Value memref,
   return success();
 }
 
-Value castToCanonical(OpBuilder &builder, Location loc, Value memref) {
-  Type canonical = CanonicalMemRefType(builder.getContext());
-  if (memref.getType() == canonical) return memref;
-  return memref::CastOp::create(builder, loc, canonical, memref);
-}
-
-// Erases `matmulOutput`'s defining memref.alloc if the fusion left it with
-// no remaining users - keeps the rewritten IR free of dead intermediate
-// buffers instead of relying on a later canonicalization pass.
+// Erases `matmulOutput`'s defining memref.alloc (and its deallocs) if the
+// fusion left it with no other users - keeps the rewritten IR free of dead
+// intermediate buffers instead of relying on a later canonicalization pass.
 void eraseIfDeadAlloc(Value value) {
-  if (!value.use_empty()) return;
-  if (auto allocOp = value.getDefiningOp<memref::AllocOp>()) allocOp.erase();
+  auto allocOp = value.getDefiningOp<memref::AllocOp>();
+  if (!allocOp) return;
+  if (!llvm::all_of(value.getUsers(), llvm::IsaPred<memref::DeallocOp>))
+    return;
+  for (Operation *user : llvm::make_early_inc_range(value.getUsers()))
+    user->erase();
+  allocOp.erase();
 }
 
 } // namespace
@@ -130,24 +142,26 @@ LogicalResult emitExternalFusedCall(OpBuilder &builder,
   Value nI64 = arith::IndexCastOp::create(builder, loc, i64Ty, n);
   Value kI64 = arith::IndexCastOp::create(builder, loc, i64Ty, k);
 
-  // Prefer alpha/beta extracted by the GELU body matcher; they default to
-  // identity (1.0, 0.0) when the generic only encodes Act(A @ B).
+  // The runtime computes D = FastGELU(alpha * (A @ B) + beta * D); the
+  // matcher only accepts FastGELU(A @ B), so these are always 1.0 / 0.0.
   Value alpha = arith::ConstantFloatOp::create(
-      builder, loc, builder.getF32Type(), llvm::APFloat(match.alpha));
+      builder, loc, builder.getF32Type(), llvm::APFloat(1.0f));
   Value beta = arith::ConstantFloatOp::create(
-      builder, loc, builder.getF32Type(), llvm::APFloat(match.beta));
+      builder, loc, builder.getF32Type(), llvm::APFloat(0.0f));
 
-  Value aCast = castToCanonical(builder, loc, a);
-  Value bCast = castToCanonical(builder, loc, b);
-  Value dCast = castToCanonical(builder, loc, d);
+  Value aPtr = toBarePointer(builder, loc, a);
+  Value bPtr = toBarePointer(builder, loc, b);
+  Value dPtr = toBarePointer(builder, loc, d);
 
   func::CallOp::create(
       builder, loc, externalFn,
-      ValueRange{aCast, bCast, dCast, mI64, nI64, kI64, alpha, beta});
+      ValueRange{aPtr, bPtr, dPtr, mI64, nI64, kI64, alpha, beta});
 
   Value matmulOutput = matmul.getOutputs()[0];
   activation.erase();
   matmul.erase();
+  if (linalg::FillOp zeroInit = match.zeroInit)
+    zeroInit.erase();
   eraseIfDeadAlloc(matmulOutput);
 
   return success();

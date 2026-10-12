@@ -16,7 +16,6 @@
 int main(int argc, char **argv) {
   mlir::registerAllPasses();
   cu_epilogue::registerFuseGemmGeluPass();
-
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
 

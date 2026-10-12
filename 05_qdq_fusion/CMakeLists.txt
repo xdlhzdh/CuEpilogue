@@ -43,6 +43,7 @@ add_mlir_library(CutlassQGemmPasses
   MLIRTensorDialect
   MLIRBufferizationDialect
   MLIRBufferizationTransforms
+  MLIRLLVMDialect
 )
 target_include_directories(CutlassQGemmPasses PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -98,6 +99,46 @@ if(CU_EPILOGUE_ENABLE_CUDA AND TARGET cu_epilogue_common)
     add_executable(stage5_qgemm_correctness_test kernels/correctness_test.cu)
     target_link_libraries(stage5_qgemm_correctness_test PRIVATE qgemm_bias_gelu)
     add_test(NAME stage5_qgemm_correctness_test COMMAND stage5_qgemm_correctness_test)
+  endif()
+
+  # GPU end-to-end test: AOT-compile test/e2e_device_model.mlir to an object
+  # and link it into a harness that owns device memory like an inference
+  # framework would. Prints SKIP when no GPU is visible at test time.
+  find_program(CU_EPILOGUE_MLIR_TRANSLATE mlir-translate HINTS ${LLVM_TOOLS_BINARY_DIR})
+  find_program(CU_EPILOGUE_LLC llc HINTS ${LLVM_TOOLS_BINARY_DIR})
+  if(CU_EPILOGUE_BUILD_TESTS AND CU_EPILOGUE_MLIR_TRANSLATE AND CU_EPILOGUE_LLC)
+    set(STAGE5_E2E_MODEL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/test/e2e_device_model.mlir)
+    set(STAGE5_E2E_MODEL ${CMAKE_CURRENT_BINARY_DIR}/e2e_device_model)
+    add_custom_command(
+      OUTPUT ${STAGE5_E2E_MODEL}.o
+      COMMAND qdq-opt ${STAGE5_E2E_MODEL_SRC}
+        --fuse-qdq-qgemm-bias-gelu
+        "--one-shot-bufferize=bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map"
+        --lower-cutlass-qgemm-to-call
+        --finalize-memref-to-llvm --convert-arith-to-llvm --convert-func-to-llvm
+        --reconcile-unrealized-casts
+        -o ${STAGE5_E2E_MODEL}.llvm.mlir
+      COMMAND ${CU_EPILOGUE_MLIR_TRANSLATE} --mlir-to-llvmir
+        ${STAGE5_E2E_MODEL}.llvm.mlir -o ${STAGE5_E2E_MODEL}.ll
+      COMMAND ${CU_EPILOGUE_LLC} -filetype=obj -relocation-model=pic
+        ${STAGE5_E2E_MODEL}.ll -o ${STAGE5_E2E_MODEL}.o
+      DEPENDS qdq-opt ${STAGE5_E2E_MODEL_SRC}
+      COMMENT "AOT-compiling stage 5 e2e model"
+      VERBATIM
+    )
+    set_source_files_properties(${STAGE5_E2E_MODEL}.o PROPERTIES
+      EXTERNAL_OBJECT TRUE GENERATED TRUE
+    )
+    add_executable(stage5_device_e2e_test
+      test/e2e_device_test.cu ${STAGE5_E2E_MODEL}.o
+    )
+    target_include_directories(stage5_device_e2e_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/03_fastgelu_epilogue
+    )
+    target_link_libraries(stage5_device_e2e_test PRIVATE
+      cutlass_qgemm_bias_gelu_runtime cu_epilogue_common
+    )
+    add_test(NAME stage5_device_e2e_test COMMAND stage5_device_e2e_test)
   endif()
 
   # CUTLASS 3.x Sm90 visitor / EVT path (side-by-side with the SIMT kernel).

@@ -40,10 +40,21 @@ check_present() {
 
 check_absent() {
   if grep -q -- "$1" "$OUT"; then
-    echo "FAIL: unexpected pattern still present (should have been fused away): $1" >&2
+    echo "FAIL: unexpected pattern present: $1" >&2
     fail=1
   else
     echo "PASS: pattern correctly absent: $1"
+  fi
+}
+
+check_count() {
+  local actual
+  actual="$(grep -c -- "$1" "$OUT" || true)"
+  if [[ "$actual" == "$2" ]]; then
+    echo "PASS: found $2 x pattern: $1"
+  else
+    echo "FAIL: expected $2 x pattern, found $actual: $1" >&2
+    fail=1
   fi
 }
 
@@ -71,13 +82,22 @@ check_absent "linalg.generic"
 check_present "1.000000e+00"
 check_present "0.000000e+00"
 
-run_fuse_case "alpha/beta GELU" "$SCRIPT_DIR/fuse_pattern_alpha_beta.mlir"
-check_present "call @cutlass_fused_gemm_gelu"
-check_present "func.func private @cutlass_fused_gemm_gelu"
-check_absent "linalg.matmul"
-check_absent "linalg.generic"
-check_present "2.000000e+00"
-check_present "5.000000e-01"
+echo "== Lowering fused call to LLVM: external signature must match the C API =="
+"$FUSED_OPT" "$SCRIPT_DIR/fuse_pattern.mlir" \
+  --one-shot-bufferize="$BUFFERIZE_OPTS" \
+  --fuse-gemm-gelu \
+  --finalize-memref-to-llvm --convert-arith-to-llvm --convert-func-to-llvm \
+  --reconcile-unrealized-casts \
+  > "$OUT"
+check_present "llvm.func @cutlass_fused_gemm_gelu(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, f32, f32)"
+check_present "llvm.call @cutlass_fused_gemm_gelu"
+
+run_fuse_case "rejected patterns" "$SCRIPT_DIR/fuse_pattern_negative.mlir"
+check_absent "call @cutlass_fused_gemm_gelu"
+check_count "linalg.matmul" 6
+check_count "linalg.generic" 6
+check_present "math.erf"
+check_present "math.tanh"
 
 rm -f "$OUT"
 

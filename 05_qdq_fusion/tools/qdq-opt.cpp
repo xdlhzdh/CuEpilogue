@@ -10,7 +10,6 @@ int main(int argc, char **argv) {
   mlir::registerAllPasses();
   cu_epilogue::registerFuseQdqQgemmBiasGeluPass();
   cu_epilogue::registerLowerCutlassQgemmToCallPass();
-
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   registry.insert<cu_epilogue::CutlassDialect>();

@@ -9,15 +9,13 @@ namespace cu_epilogue {
 /// A matched (matmul, GELU-activation) pair found by FuseGemmGeluPattern.cpp,
 /// ready to be lowered to an external call by EmitExternalCall.cpp.
 ///
-/// `alpha` / `beta` are the epilogue scalars for
-///   D = FastGELU(alpha * (A @ B) + beta * C)
-/// extracted from the activation body when possible, otherwise normalized to
-/// the identity defaults (1.0, 0.0).
+/// The match always means D = FastGELU(A @ B). `zeroInit` is the
+/// `linalg.fill 0.0` of the matmul's local accumulator buffer; it is erased
+/// along with the matmul.
 struct FusedGemmGeluMatch {
   mlir::linalg::MatmulOp matmul;
   mlir::linalg::GenericOp activation;
-  float alpha = 1.0f;
-  float beta = 0.0f;
+  mlir::linalg::FillOp zeroInit;
 };
 
 /// Replaces `match.matmul` + `match.activation` with a call to the external
