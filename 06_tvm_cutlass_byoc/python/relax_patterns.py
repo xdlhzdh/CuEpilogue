@@ -122,6 +122,43 @@ def match_qdq_pattern(
 
         DQ(A), DQ(B) -> matmul -> +bias -> FastGELU
           -> /scale_d + zp_d -> round -> clip [-> astype int8]
+
+    Concrete Relax IR example (from ``build_qdq_relax_module(64, 64, 64,
+    scale_a=0.05, zp_a=1, scale_b=0.04, zp_b=-2, scale_d=0.08, zp_d=3)``;
+    all bindings live in a single ``R.dataflow()`` block)::
+
+        @R.function
+        def main(
+            A: R.Tensor((64, 64), dtype="int8"),
+            B: R.Tensor((64, 64), dtype="int8"),
+            bias: R.Tensor((64,), dtype="float32"),
+        ) -> R.Tensor((64, 64), dtype="int8"):
+            with R.dataflow():
+                # DQ(A): (astype(A) - zp_a) * scale_a
+                lv = R.astype(A, dtype="float32")
+                lv2 = R.subtract(lv, R.const(1.0, "float32"))
+                lv3 = R.multiply(lv2, R.const(0.05, "float32"))
+                # DQ(B): (astype(B) - zp_b) * scale_b
+                lv1 = R.astype(B, dtype="float32")
+                lv4 = R.subtract(lv1, R.const(-2.0, "float32"))
+                lv5 = R.multiply(lv4, R.const(0.04, "float32"))
+                # matmul + bias
+                lv6 = R.matmul(lv3, lv5, out_dtype="float32")
+                lv7 = R.add(lv6, bias)
+                # FastGELU: x / (1 + 2^(c*x)), c = -2.455492; numerator shares lv7
+                lv8 = R.multiply(lv7, R.const(-2.455492, "float32"))
+                lv9 = R.power(R.const(2.0, "float32"), lv8)
+                lv10 = R.add(lv9, R.const(1.0, "float32"))
+                lv11 = R.divide(lv7, lv10)
+                # Q: clip(round(gelu / scale_d + zp_d)) -> int8
+                lv12 = R.divide(lv11, R.const(0.08, "float32"))
+                lv13 = R.add(lv12, R.const(3.0, "float32"))
+                lv14 = R.round(lv13)
+                lv15 = R.clip(lv14, -128.0, 127.0)
+                lv16 = R.astype(lv15, dtype="int8")
+                gv = lv16
+                R.output(gv)
+            return gv
     """
     if not isinstance(func.body, relax.SeqExpr):
         if debug:
@@ -387,3 +424,140 @@ def annotate_composite(mod: tvm.IRModule) -> Tuple[tvm.IRModule, Optional[dict]]
 
     new_mod = tvm.IRModule({main_gv: new_main})
     return new_mod, info
+
+
+def _check_qdq_fusion(ctx) -> bool:
+    """Reject matches that are not stage-5 FastGELU (c and power base)."""
+    annotated = ctx.annotated_expr
+    c = _extract_scalar(annotated.get("gelu_c"))
+    base = _extract_scalar(annotated.get("pow_base"))
+    return (
+        c is not None
+        and abs(c - FAST_GELU_CONST) < 1e-5
+        and base is not None
+        and abs(base - 2.0) < 1e-6
+    )
+
+
+def _qdq_attrs_getter(annotated: dict) -> dict:
+    """Attach affine params during FuseOpsByPattern (no second hand matcher)."""
+
+    def scalar(key: str) -> float:
+        val = _extract_scalar(annotated[key])
+        if val is None:
+            raise ValueError(f"FusionPattern attrs_getter: missing scalar {key}")
+        return float(val)
+
+    return {
+        "cutlass.scale_a": str(scalar("scale_a")),
+        "cutlass.zp_a": str(int(round(scalar("zp_a")))),
+        "cutlass.scale_b": str(scalar("scale_b")),
+        "cutlass.zp_b": str(int(round(scalar("zp_b")))),
+        "cutlass.scale_d": str(scalar("scale_d")),
+        "cutlass.zp_d": str(int(round(scalar("zp_d")))),
+        "cutlass.matched": "1",
+    }
+
+
+def build_qdq_fusion_pattern():
+    """DFPattern / FusionPattern for FuseOpsByPattern (official BYOC path).
+
+    ``attrs_getter`` writes ``cutlass.scale_*`` / ``cutlass.zp_*`` onto the
+    fused Composite function so ``relax.ext.cutlass`` can read them directly.
+    """
+    from tvm.relax.dpl import is_const, is_op, wildcard
+    from tvm.relax.transform import FusionPattern
+
+    a = wildcard()
+    b = wildcard()
+    bias = wildcard()
+
+    zp_a = is_const()
+    scale_a = is_const()
+    zp_b = is_const()
+    scale_b = is_const()
+    a_dq = is_op("relax.multiply")(
+        is_op("relax.subtract")(is_op("relax.astype")(a), zp_a),
+        scale_a,
+    )
+    b_dq = is_op("relax.multiply")(
+        is_op("relax.subtract")(is_op("relax.astype")(b), zp_b),
+        scale_b,
+    )
+    mm = is_op("relax.matmul")(a_dq, b_dq)
+    biased = is_op("relax.add")(mm, bias)
+
+    gelu_c = is_const()
+    gelu_mul = is_op("relax.multiply")(biased, gelu_c)
+    pow_base = is_const()
+    gelu_pow = is_op("relax.power")(pow_base, gelu_mul)
+    gelu_den = is_op("relax.add")(gelu_pow, is_const())
+    gelu = is_op("relax.divide")(biased, gelu_den)
+
+    scale_d = is_const()
+    zp_d = is_const()
+    # clip(value, min, max) — arity must be 3 for TVM 0.26 matching
+    out = is_op("relax.astype")(
+        is_op("relax.clip")(
+            is_op("relax.round")(
+                is_op("relax.add")(
+                    is_op("relax.divide")(gelu, scale_d),
+                    zp_d,
+                )
+            ),
+            wildcard(),
+            wildcard(),
+        )
+    )
+
+    return FusionPattern(
+        COMPOSITE_NAME,
+        out,
+        annotation_patterns={
+            "A": a,
+            "B": b,
+            "bias": bias,
+            "zp_a": zp_a,
+            "scale_a": scale_a,
+            "zp_b": zp_b,
+            "scale_b": scale_b,
+            "gelu_c": gelu_c,
+            "pow_base": pow_base,
+            "gelu_mul": gelu_mul,
+            "gelu_pow": gelu_pow,
+            "scale_d": scale_d,
+            "zp_d": zp_d,
+        },
+        check=_check_qdq_fusion,
+        attrs_getter=_qdq_attrs_getter,
+    )
+
+
+def _module_has_cutlass_offload(mod: tvm.IRModule) -> bool:
+    for gv in mod.get_global_vars():
+        func = mod[gv]
+        attrs = func.attrs
+        if attrs is None:
+            continue
+        if attrs.get("Codegen") == "cutlass":
+            return True
+        if attrs.get("Composite") == COMPOSITE_NAME:
+            return True
+    return False
+
+
+def fuse_qdq_by_df_pattern(mod: tvm.IRModule) -> Tuple[tvm.IRModule, bool]:
+    """Fuse QDQ via FuseOpsByPattern(annotate_codegen=True).
+
+    On success the module contains a ``Codegen="cutlass"`` wrapper (and nested
+    ``Composite=cutlass.qgemm_bias_gelu``). Does not rewrite to packed call.
+    """
+    from tvm.relax.transform import FuseOpsByPattern
+
+    pattern = build_qdq_fusion_pattern()
+    fused = FuseOpsByPattern(
+        [pattern],
+        bind_constants=True,
+        annotate_codegen=True,
+    )(mod)
+    return fused, _module_has_cutlass_offload(fused)

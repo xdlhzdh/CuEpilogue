@@ -4,11 +4,18 @@
 
 ```text
 手写 Relax QDQ 图
-  → pattern 匹配
+  → pattern 匹配（手写 SSA 或 DFPattern + FuseOpsByPattern）
   → call_dps_packed("cu_epilogue.qgemm_bias_gelu")
   → libcutlass_qgemm_bias_gelu_runtime.so
       内部 3 个 CUDA kernel：RowSum + Gemm + ColSum
 ```
+
+匹配路径由 `apply_pipeline(mod, method=...)` 选择：
+
+| `method` | 行为 |
+| --- | --- |
+| `"handwritten"`（默认） | 手写反向 SSA `match_qdq_pattern` → 标注 Composite → `rewrite_to_extern` → `call_dps_packed("cu_epilogue.qgemm_bias_gelu")` |
+| `"dfpattern"` | `FuseOpsByPattern(annotate_codegen=True)` + `attrs_getter` 写入 scale/zp → `relax.ext.cutlass` 只读 attrs → `RunCodegen` → `call_dps_packed(<global_symbol>)` 调阶段五 `.so` |
 
 测得的数字见 [docs/benchmarking_report.md](docs/benchmarking_report.md)。
 

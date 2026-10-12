@@ -11,6 +11,7 @@ from tvm import runtime as rt
 from qdq_reference import make_test_inputs, reference_qgemm_bias_gelu
 from relax_patterns import build_qdq_relax_module
 from relax_pipeline import (
+    PipelineMethod,
     apply_pipeline,
     build_vm,
     default_target_and_device,
@@ -24,12 +25,13 @@ def run_e2e(
     n: int = 64,
     k: int = 64,
     seed: int = 0,
+    method: PipelineMethod = "handwritten",
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     A, B, bias, sa, za, sb, zb, sd, zd = make_test_inputs(m, n, k, seed=seed)
     ref = reference_qgemm_bias_gelu(A, B, bias, sa, za, sb, zb, sd, zd)
 
     mod = build_qdq_relax_module(m, n, k, sa, za, sb, zb, sd, zd)
-    rewritten, info = apply_pipeline(mod)
+    rewritten, info = apply_pipeline(mod, method=method)
     register_qgemm_meta(
         info["scale_a"],
         info["zp_a"],

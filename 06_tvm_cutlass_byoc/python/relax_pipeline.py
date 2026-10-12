@@ -1,7 +1,7 @@
 """Relax pipeline: pattern annotate → rewrite main to external packed call."""
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import tvm
 from tvm import relax
@@ -9,8 +9,11 @@ from tvm import relax
 from relax_patterns import (
     COMPOSITE_NAME,
     annotate_composite,
+    fuse_qdq_by_df_pattern,
 )
 from so_wrapper import device_synchronize, launch, launch_device
+
+PipelineMethod = Literal["handwritten", "dfpattern"]
 
 _META = {
     "scale_a": 0.05,
@@ -114,6 +117,12 @@ def fuse_and_partition(mod: tvm.IRModule) -> Tuple[tvm.IRModule, Optional[dict]]
     return annotate_composite(mod)
 
 
+def _main_function(mod: tvm.IRModule):
+    gvs = list(mod.get_global_vars())
+    main_gv = next((g for g in gvs if g.name_hint == "main"), gvs[0])
+    return main_gv, mod[main_gv]
+
+
 def _meta_from_func(func: relax.Function) -> dict:
     return {
         "scale_a": float(func.attrs["cutlass.scale_a"]),
@@ -130,12 +139,17 @@ def _meta_from_func(func: relax.Function) -> dict:
 
 def rewrite_to_extern(mod: tvm.IRModule, info: Optional[dict] = None) -> tvm.IRModule:
     """Replace matched main with call_dps_packed to cu_epilogue.qgemm_bias_gelu."""
-    gvs = list(mod.get_global_vars())
-    main_gv = next((g for g in gvs if g.name_hint == "main"), gvs[0])
-    main = mod[main_gv]
-    if main.attrs is None or main.attrs.get("Composite") != COMPOSITE_NAME:
-        raise ValueError("module is not annotated as cutlass.qgemm_bias_gelu composite")
-    meta = info or _meta_from_func(main)
+    _main_gv, main = _main_function(mod)
+    # Handwritten path annotates main; DFPattern path may only annotate the
+    # fused Codegen wrapper — then *info* must be supplied by the caller.
+    if info is None:
+        if main.attrs is None or main.attrs.get("Composite") != COMPOSITE_NAME:
+            raise ValueError(
+                "module is not annotated as cutlass.qgemm_bias_gelu composite"
+            )
+        meta = _meta_from_func(main)
+    else:
+        meta = info
 
     params = list(main.params)
     a_ty = params[meta["param_A"]].ty
@@ -178,12 +192,49 @@ def rewrite_to_extern(mod: tvm.IRModule, info: Optional[dict] = None) -> tvm.IRM
     return tvm.IRModule({out_mod.get_global_vars()[0]: new_main})
 
 
-def apply_pipeline(mod: tvm.IRModule) -> Tuple[tvm.IRModule, dict]:
-    fused, info = fuse_and_partition(mod)
-    if info is None:
-        raise ValueError("QDQ pattern did not match")
-    rewritten = rewrite_to_extern(fused, info)
-    return rewritten, info
+def apply_pipeline(
+    mod: tvm.IRModule,
+    method: PipelineMethod = "handwritten",
+) -> Tuple[tvm.IRModule, dict]:
+    """Match QDQ and offload to packed CUTLASS call.
+
+    Parameters
+    ----------
+    method:
+        ``"handwritten"`` — SSA reverse-trace matcher + Composite attrs →
+        ``rewrite_to_extern`` (default).
+        ``"dfpattern"`` — ``FuseOpsByPattern(annotate_codegen=True)`` →
+        registered ``relax.ext.cutlass`` via ``RunCodegen`` (official BYOC
+        Codegen hook; runtime still hits stage-5 ``.so``).
+    """
+    if method == "handwritten":
+        fused, info = fuse_and_partition(mod)
+        if info is None:
+            raise ValueError("QDQ pattern did not match")
+        rewritten = rewrite_to_extern(fused, info)
+        return rewritten, info
+
+    if method == "dfpattern":
+        # Register Codegen hook before RunCodegen looks up relax.ext.cutlass.
+        import cutlass_codegen as _cutlass_codegen
+
+        _cutlass_codegen.ensure_cutlass_codegen_registered()
+
+        fused, matched = fuse_qdq_by_df_pattern(mod)
+        if not matched:
+            raise ValueError("QDQ DFPattern / FuseOpsByPattern did not match")
+
+        info = _cutlass_codegen.extract_meta_from_fused_module(fused)
+        if info is None:
+            raise ValueError("QDQ meta extract failed after FuseOpsByPattern")
+
+        # Official BYOC lowering: invoke relax.ext.cutlass for Codegen=cutlass.
+        lowered = relax.transform.RunCodegen()(fused)
+        # Hook may refine meta; prefer last codegen snapshot when present.
+        info = _cutlass_codegen.last_codegen_meta() or info
+        return lowered, info
+
+    raise ValueError(f"unknown pipeline method: {method!r}")
 
 
 def build_vm(

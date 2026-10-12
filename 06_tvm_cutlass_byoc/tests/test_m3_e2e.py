@@ -39,3 +39,10 @@ def test_e2e_correctness_and_single_launch():
     diff = np.abs(out.astype(np.int16) - ref.astype(np.int16))
     assert int(diff.max()) <= 1
     assert nlaunch == 1, f"expected 1 fused launch, got {nlaunch}"
+
+
+def test_e2e_dfpattern_correctness_and_single_launch():
+    out, ref, nlaunch = run_e2e(64, 64, 64, method="dfpattern")
+    diff = np.abs(out.astype(np.int16) - ref.astype(np.int16))
+    assert int(diff.max()) <= 1
+    assert nlaunch == 1, f"expected 1 fused launch, got {nlaunch}"
