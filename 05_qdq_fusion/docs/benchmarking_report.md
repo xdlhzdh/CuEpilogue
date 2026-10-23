@@ -104,3 +104,4 @@ cd build && ctest -R stage5_visitor --output-on-failure
 | `kernels/qgemm_bias_gelu.cu` | 默认 SIMT INT8 融合 kernel |
 | `runtime/cutlass_qgemm_bias_gelu_c_api.cu` | 共享库 ABI |
 | `kernels/correctness_test.cu` | GPU vs CPU affine 参考 |
+| [`docs/pipeline_handoff_analysis.md`](pipeline_handoff_analysis.md) | Prologue、Mainloop、Epilogue 的三次衔接，以及编译器改哪一段 |
