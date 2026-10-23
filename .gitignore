@@ -2,6 +2,8 @@
 .recode
 
 # Build output / editor tooling caches
+# Multi-root workspace paths are machine-specific.
+*.code-workspace
 build/
 build*/
 .cache/
