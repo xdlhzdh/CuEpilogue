@@ -107,6 +107,17 @@ if echo "$overlap_report" | grep -q '^FAIL'; then
 fi
 
 echo
+# GEMM operands come from smem through WGMMA descriptors and the epilogue math
+# runs on the accumulator registers; smem is only written to stage O for the
+# TMA store. Any shared-memory load means a stage started reading smem back.
+smem_loads=$(grep -cE '\bLDS(M)?\b' "$SASS" || true)
+if [[ "$smem_loads" -eq 0 ]]; then
+  echo "PASS  no shared-memory loads (LDS/LDSM): epilogue computes on accumulator registers"
+else
+  echo "FAIL  $smem_loads shared-memory LDS/LDSM instructions"
+  ok=0
+fi
+
 spills=$(grep -cE '\b(LDL|STL)\b' "$SASS" || true)
 if [[ "$spills" -eq 0 ]]; then
   echo "PASS  no local-memory spills (LDL/STL)"

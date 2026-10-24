@@ -17,7 +17,7 @@ O = \mathrm{softmax}(S)\,V,\qquad
 
 本文回答三个问题：
 
-1. 一个线程块内部怎样分工，数据在各阶段之间怎样交接（第 3、4 节）；
+1. 一个线程块内部怎样分工，Prologue、Mainloop、Epilogue 各做什么，数据在各阶段之间怎样交接（第 3、4 节）；
 2. Mainloop 内部，前一个块的 epilogue 部分（GEMM2）怎样与后一个块的 prologue 部分（GEMM1、softmax）同时进行（第 5 节）；
 3. 相邻两个 Q tile 之间，前一个 tile 的 Epilogue 与后一个 tile 的 Prologue 是否同时进行（第 6 节）。结论是目前没有，第 6 节说明原因和改法。
 
@@ -64,7 +64,7 @@ O = \mathrm{softmax}(S)\,V,\qquad
 | --- | --- |
 | `kSerial` | 每个块依次执行 GEMM1、softmax、GEMM2，三者不重叠。用作对照 |
 | `kIntraWGOverlap` | 同一个 warpgroup 内，块 n-1 的 GEMM2 与块 n 的 softmax 同时进行（第 5.2 节） |
-| `kPingPong`（默认） | 在上一种的基础上，两个计算 warpgroup 轮流发出矩阵乘（第 5.3 节） |
+| `kPingPong`（默认） | 在上一种的基础上，两个计算 warpgroup 轮流发出矩阵乘（第 5.4 节） |
 
 ---
 
@@ -110,7 +110,7 @@ K 和 V 各用一套独立的同步对象，所以 GEMM1 只需等 K 到达，�
 
 ---
 
-## 4. 各阶段之间的四次交接
+## 4. Prologue、Mainloop、Epilogue：各做什么，怎样交接
 
 ### 4.1 总览
 
@@ -131,13 +131,41 @@ Epilogue                                               O 除以行和，算 LSE 
                                                        LSE 由各线程直接写回显存
 ```
 
-### 4.2 交接 0：初始化 → 所有线程
+### 4.2 三个阶段各做什么
+
+下表按时间顺序列出每个阶段中两种角色的工作，以及这个阶段结束时交给下一阶段的数据。代码入口：Prologue 和 Epilogue 在 [`flash_attn_fwd_sm90.cu`](kernels/flash_attn_fwd_sm90.cu) 的 kernel 函数里；Mainloop 是 [`flash_attn_mainloop_sm90.cuh`](kernels/flash_attn_mainloop_sm90.cuh) 的 `load()`（加载方）和 `mma()`（计算方）。
+
+| 阶段 | 加载方（WG0 的线程 0） | 计算方（WG1、WG2，每个负责 64 行） | 结束时交出 |
+| --- | --- | --- | --- |
+| **Prologue** | 1. 预取 TMA 描述符；warp 0 初始化所有 mbarrier<br>2. 全 CTA `__syncthreads()`<br>3. 把寄存器上限降到 24<br>4. 告诉 `barrier_q` 将写入多少字节，发出 Q 的 TMA | 1. 同左第 2 步<br>2. 把寄存器上限升到 240<br>3. 累加器 `tOrO` 清零；每行 `row_max = -∞`、`row_sum = 0`<br>4. 等待 `barrier_q`，即等 Q 到达 smem | smem 中的 Q；寄存器中清零的 O 和 softmax 状态 |
+| **Mainloop** | 对 n = 0, …, N-1：等 K 槽位空 → 发出 K(n) 的 TMA；等 V 槽位空 → 发出 V(n) 的 TMA。前两次两个槽位都空，不用等待，相当于预取。循环结束后用 `producer_tail` 等所有槽位被释放 | 对每个块 n：<br>1. 等 K(n) 到达 → GEMM1：\(S = QK(n)^\top\) → 释放 K 槽位<br>2. 需要时做 mask<br>3. online softmax：更新 `row_max`、`row_sum`，把 S 原地变成 P，得到缩放系数 α<br>4. O 乘 α<br>5. 等 V(n) 到达 → GEMM2：\(O \mathrel{+}= PV(n)\) → 释放 V 槽位<br>重叠调度只改变这些步骤的执行顺序（流水线 prologue / 稳态循环 / 流水线 epilogue，见第 5 节），计算内容不变 | 寄存器中的 `tOrO`（尚未除以行和）、`row_max`、`row_sum` |
+| **Epilogue** | 无工作 | 1. 在寄存器中完成全部计算：行和规约、O 乘 1/行和、算 LSE（`finalize`）<br>2. 在寄存器中把 O 从 fp32 转成 fp16<br>3. 把 fp16 的 O 写入 smem_q，同步<br>4. 线程 0 用 TMA 把 O 写回显存，并等待 TMA 读完 smem<br>5. LSE 直接从寄存器写回显存 | 显存中的 O 和 LSE |
+
+#### Epilogue 的计算在累加器寄存器上完成
+
+用 GEMM epilogue 的通用形式 \(D = \alpha \cdot \mathrm{acc} + \beta \cdot C\) 来对照：
+
+- acc 是 Mainloop 留在寄存器中的累加器 `tOrO`；
+- α 不是标量，而是每行一个值：\(\alpha_i = 1/\ell_i\)，\(\ell_i\) 是第 i 行的指数和；
+- 没有 C，相当于 β = 0；
+- 另外还要算出每行的 \(\mathrm{LSE}_i = m_i \cdot \mathrm{scale} + \log \ell_i\)。
+
+这些计算都由 `OnlineSoftmax::finalize` 直接在 `tOrO` 上完成。每个线程持有的 O 元素和它们所在行的 \(\ell_i\)、\(m_i\) 在同一个线程（或相邻 4 个线程）的寄存器里，只需一次 `shfl_xor` 规约得到整行的和，不需要先把累加器搬到 smem 换排列。之后 `convert_type` 在寄存器中转成 fp16。
+
+smem 只在计算全部结束后使用：作为 TMA 写回的暂存区。线程只向 smem 写，不会再从 smem 读回数据做计算。
+
+机器码可以验证这一点：
+
+- 12 个 kernel 中没有任何 smem 读取指令（`LDS`/`LDSM`），第 8 节的检查脚本会确认这一点；
+- Epilogue 段的指令顺序是：`SHFL.BFLY`（行和规约）→ `MUFU.RCP`（求倒数）→ `FMUL`（乘到累加器上）→ `F2FP`（转 fp16）→ 写 smem → `BAR.SYNC` → `UTMASTG`（TMA 写回）。
+
+### 4.3 交接 0：初始化 → 所有线程
 
 warp 0 中的一个线程初始化 `barrier_q`；两个 `PipelineTmaAsync` 对象在构造时初始化各自的 mbarrier。随后执行 `__syncthreads()`，保证所有线程在使用 mbarrier 之前都能看到初始化结果。
 
 这是整个 kernel 中唯一一次全 CTA 同步。此后加载方和计算方只通过 mbarrier 与 named barrier 通信。
 
-### 4.3 交接 1：加载方 → 计算方（经由 smem）
+### 4.4 交接 1：加载方 → 计算方（经由 smem）
 
 **Q 只加载一次。** 加载方先告诉 `barrier_q` 「将有 `kTmaBytesQ` 字节写入」（`arrive_and_expect_tx`），再发出 TMA。字节全部写入后，`barrier_q` 完成第一轮。计算方用 `wait(&barrier_q, 0)` 等待这一轮完成。
 
@@ -154,7 +182,7 @@ warp 0 中的一个线程初始化 `barrier_q`；两个 `PipelineTmaAsync` 对�
 
 **释放越早，下一次加载越早开始。** K(n) 在 GEMM1(n) 完成后立即释放，V(n) 在 GEMM2(n) 完成后释放。槽位释放后，加载方即可向其中写入 K(n+2) 或 V(n+2)。
 
-### 4.4 交接 2：Mainloop → Epilogue（经由寄存器）
+### 4.5 交接 2：Mainloop → Epilogue（经由寄存器）
 
 Mainloop 结束时，每个计算线程的寄存器中有：
 
@@ -169,7 +197,7 @@ Epilogue 中的 `finalize`：
 
 采用重叠调度时，稳态循环的最后一次结束后，最后一块的 epilogue 部分（GEMM2）还没有执行，要在流水线 epilogue 中执行（第 5.2 节）。因此 O 在流水线 epilogue 完成后才是最终值：交接 2 发生在流水线 epilogue 之后，kernel 级的 Epilogue 必须等它结束才能开始。
 
-### 4.5 交接 3：Epilogue → 显存
+### 4.6 交接 3：Epilogue → 显存
 
 O 用 TMA 一次写回，TMA 要求数据先在 smem 中排好。本 kernel 不单独分配 O 的缓冲区，而是复用 `smem_q`。顺序如下：
 
@@ -294,7 +322,7 @@ CTA i+1：                                                                      
 2. 初始化 mbarrier、预取 TMA 描述符；
 3. 从显存读取 Q、K0、V0 的完整延迟。
 
-CTA i 的 Epilogue 期间，加载方已经没有任务（第 4.5 节），但它不能提前为下一个 tile 加载数据，因为下一个 tile 不归这个 CTA 计算。
+CTA i 的 Epilogue 期间，加载方已经没有任务（第 4.6 节），但它不能提前为下一个 tile 加载数据，因为下一个 tile 不归这个 CTA 计算。
 
 tile 数远多于 SM 数时（长序列、多 head），每个 tile 都要付一次这段等待时间。每个 tile 的块数 N 越少（seq_k 较短，或 causal 时靠前的 tile），这段时间占总时间的比例越高。
 
@@ -384,7 +412,8 @@ rtk ctest --test-dir build -R stage8 --output-on-failure
    - 串行调度：不应出现这样的区间；
    - 两种重叠调度：每个区间至少有 32 条 `MUFU.EX2`（一块最多 66 条）；
    - 轮流调度：还必须出现 named barrier 的到达指令 `BAR.ARV`。
-3. 不能有寄存器溢出到本地内存的指令（`LDL`/`STL`）。
+3. 不能有 smem 读取指令（`LDS`/`LDSM`）。矩阵乘通过 WGMMA 直接读 smem，不经过这类指令；Epilogue 在累加器寄存器上计算，只向 smem 写。出现 smem 读取，说明某个阶段改成了先写 smem 再读回计算（第 4.2 节）。
+4. 不能有寄存器溢出到本地内存的指令（`LDL`/`STL`）。
 
 当前结果：12 个 kernel 全部通过；每个区间有 57–66 条 `MUFU.EX2`；每线程 168 个寄存器，无溢出。
 
@@ -408,4 +437,5 @@ WAIT <= 0                           等 GEMM2 完成
 3. **K/V 只有 2 个槽位。** D=128 时 smem 已用约 160 KiB，3 个槽位需要约 224 KiB，接近上限。D=64 时有余量，但没有按 head_dim 选择槽位数。
 4. **没有使用 cluster 和 TMA 多播。** 同一个 head 的多个 tile 各自从显存读取同一份 K/V。
 5. **只有前向，只支持 fp16。** 不支持 bf16、FP8、变长序列、GQA/MQA、dropout，也没有反向计算。
-6. **重叠依赖 ptxas 的指令安排。** `__syncwarp()` 等手段不是语言保证，需要依靠第 8 节的检查发现失效。
+6. **O 写入 smem 用的是通用地址的存储指令。** 机器码中这一步是 32 条 32 位的 `ST.E`（编译器没有把它识别为 smem 专用的 `STS`），也没有使用 Hopper 的矩阵存储指令 `STSM`。结果正确，但比 CUTLASS epilogue 的做法（用 `SM90_U32x4_STSM_N` 每条指令写 4 个 32 位值）慢。
+7. **重叠依赖 ptxas 的指令安排。** `__syncwarp()` 等手段不是语言保证，需要依靠第 8 节的检查发现失效。
