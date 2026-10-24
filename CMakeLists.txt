@@ -19,6 +19,9 @@ option(CU_EPILOGUE_BUILD_TESTS "Build correctness / verification tests" ON)
 # capability < 90. Stage 4 runtime and stage 5 C ABI still use the default
 # (Sm70 functor / SIMT) kernels.
 option(CU_EPILOGUE_ENABLE_SM90_VISITOR "Build Sm90 CollectiveBuilder + LinCombEltAct visitor epilogue" ON)
+# Stage 8: hand-written Sm90 FlashAttention forward (CuTe + TMA + PipelineTmaAsync
+# + WGMMA). Always compiled for sm_90a; correctness test SKIPs below cc 90.
+option(CU_EPILOGUE_ENABLE_SM90_FMHA "Build stage 8 Sm90 FlashAttention forward kernel" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +41,7 @@ message(STATUS "CuEpilogue: CUDA stages enabled = ${CU_EPILOGUE_ENABLE_CUDA}")
 message(STATUS "CuEpilogue: MLIR stages enabled = ${CU_EPILOGUE_ENABLE_MLIR}")
 message(STATUS "CuEpilogue: TVM stage 6 enabled = ${CU_EPILOGUE_ENABLE_TVM}")
 message(STATUS "CuEpilogue: Sm90 visitor path   = ${CU_EPILOGUE_ENABLE_SM90_VISITOR}")
+message(STATUS "CuEpilogue: Sm90 FMHA (stage 8) = ${CU_EPILOGUE_ENABLE_SM90_FMHA}")
 
 if(CU_EPILOGUE_ENABLE_CUDA)
   include(CheckLanguage)
@@ -61,6 +65,9 @@ if(CU_EPILOGUE_ENABLE_CUDA)
   add_subdirectory(01_baseline_cuda)
   add_subdirectory(02_cutlass_gemm)
   add_subdirectory(03_fastgelu_epilogue)
+  if(CU_EPILOGUE_ENABLE_SM90_FMHA)
+    add_subdirectory(08_flash_attention)
+  endif()
 endif()
 
 if(CU_EPILOGUE_ENABLE_MLIR)
