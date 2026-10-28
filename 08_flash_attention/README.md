@@ -78,11 +78,11 @@ grid 为 `(ceil(seqlen_q / 128), num_heads, batch)`。**每个 CTA 只计算一�
 
 | warpgroup | 角色 | 每线程寄存器上限 | 工作 |
 | --- | --- | --- | --- |
-| WG0 | 加载方（producer） | 24 | 只有线程 0 工作：用 TMA 加载 Q，然后逐块加载 K、V |
+| WG0 | 加载方（producer） | 24 | 128 个线程一起把寄存器上限降到 24；发出 TMA 的只有线程 0 |
 | WG1 | 计算方（consumer） | 240 | 负责 tile 的第 0–63 行：GEMM1、softmax、GEMM2，最后执行 Epilogue |
 | WG2 | 计算方（consumer） | 240 | 负责第 64–127 行，工作同 WG1 |
 
-加载方几乎不需要寄存器，所以用 `setmaxnreg` 把它的寄存器让给计算方。
+表中的 24 和 240 是 `setmaxnreg` 的运行时上限，不是编译器报出来的寄存器数。加载方几乎不需要寄存器，所以把额度让给计算方。24×128 + 240×256 = 168×384；第 6.1 节和第 8 节里的「每线程 168 个寄存器」就是按这个总和折算的，用来判断一个 SM 放不下一个 CTA。
 
 ### 3.2 两次矩阵乘
 
@@ -120,14 +120,14 @@ K 和 V 各用一套独立的同步对象，所以 GEMM1 只需等 K 到达，�
 初始化         warp 0 初始化所有 mbarrier
                ─────────────── __syncthreads() ───────────────     ← 交接 0
 Prologue       TMA 加载 Q，完成时通知 barrier_q        等待 barrier_q
-               TMA 加载 K0、V0、K1、V1（两个槽位都空）
-Mainloop       逐块：等槽位空 → TMA 加载 K(n)、V(n)    逐块：等 K 到 → GEMM1 → 释放 K 槽位
-                                                              等 V 到 → GEMM2 → 释放 V 槽位
+Mainloop       先发出 K0、V0、K1、V1（槽位一开始是空的）
+               之后逐块：等槽位空 → TMA 加载下一块      串行时逐块：等 K → GEMM1 → 释放 K
+                                                              等 V → GEMM2 → 释放 V
                       「槽位已空」与「数据已到」两种 mbarrier 来回通知     ← 交接 1
-               等待所有槽位被释放后结束                 最后一块的 GEMM2
+               producer_tail：等两个槽都被释放         默认调度会把上面几步重叠，见第 5 节
 Epilogue                                               O 除以行和，算 LSE             ← 交接 2
                                                        O 写入 smem_q，同步
-                                                       线程 0 用 TMA 把 O 写回显存    ← 交接 3
+                                                       WG1 的第一个线程用 TMA 写回 O  ← 交接 3
                                                        LSE 由各线程直接写回显存
 ```
 
@@ -138,8 +138,8 @@ Epilogue                                               O 除以行和，算 LSE 
 | 阶段 | 加载方（WG0 的线程 0） | 计算方（WG1、WG2，每个负责 64 行） | 结束时交出 |
 | --- | --- | --- | --- |
 | **Prologue** | 1. 预取 TMA 描述符；warp 0 初始化所有 mbarrier<br>2. 全 CTA `__syncthreads()`<br>3. 把寄存器上限降到 24<br>4. 告诉 `barrier_q` 将写入多少字节，发出 Q 的 TMA | 1. 同左第 2 步<br>2. 把寄存器上限升到 240<br>3. 累加器 `tOrO` 清零；每行 `row_max = -∞`、`row_sum = 0`<br>4. 等待 `barrier_q`，即等 Q 到达 smem | smem 中的 Q；寄存器中清零的 O 和 softmax 状态 |
-| **Mainloop** | 对 n = 0, …, N-1：等 K 槽位空 → 发出 K(n) 的 TMA；等 V 槽位空 → 发出 V(n) 的 TMA。前两次两个槽位都空，不用等待，相当于预取。循环结束后用 `producer_tail` 等所有槽位被释放 | 对每个块 n：<br>1. 等 K(n) 到达 → GEMM1：\(S = QK(n)^\top\) → 释放 K 槽位<br>2. 需要时做 mask<br>3. online softmax：更新 `row_max`、`row_sum`，把 S 原地变成 P，得到缩放系数 α<br>4. O 乘 α<br>5. 等 V(n) 到达 → GEMM2：\(O \mathrel{+}= PV(n)\) → 释放 V 槽位<br>重叠调度只改变这些步骤的执行顺序（流水线 prologue / 稳态循环 / 流水线 epilogue，见第 5 节），计算内容不变 | 寄存器中的 `tOrO`（尚未除以行和）、`row_max`、`row_sum` |
-| **Epilogue** | 无工作 | 1. 在寄存器中完成全部计算：行和规约、O 乘 1/行和、算 LSE（`finalize`）<br>2. 在寄存器中把 O 从 fp32 转成 fp16<br>3. 把 fp16 的 O 写入 smem_q，同步<br>4. 线程 0 用 TMA 把 O 写回显存，并等待 TMA 读完 smem<br>5. LSE 直接从寄存器写回显存 | 显存中的 O 和 LSE |
+| **Mainloop** | 对 n = 0, …, N-1：等 K 槽位空 → 发出 K(n) 的 TMA；等 V 槽位空 → 发出 V(n) 的 TMA。前两次两个槽位都空，不用等待，相当于预取。循环结束后用 `producer_tail` 等所有槽位被释放 | 下面 1–5 是串行调度里一个块的顺序。默认的 `kPingPong` 不按这个顺序执行，只保证算完的内容相同（第 5 节）：<br>1. 等 K(n) 到达 → GEMM1：\(S = QK(n)^\top\) → 释放 K 槽位<br>2. 需要时做 mask<br>3. online softmax：更新 `row_max`、`row_sum`，把 S 原地变成 P，得到缩放系数 α<br>4. O 乘 α<br>5. 等 V(n) 到达 → GEMM2：\(O \mathrel{+}= PV(n)\) → 释放 V 槽位 | 寄存器中的 `tOrO`（尚未除以行和）、`row_max`、`row_sum` |
+| **Epilogue** | 无工作。`producer_tail` 在 Mainloop 末尾已经返回 | 1. 在寄存器中完成全部计算：行和规约、O 乘 1/行和、算 LSE（`finalize`）<br>2. 在寄存器中把 O 从 fp32 转成 fp16<br>3. 把 fp16 的 O 写入 smem_q，两次同步（第 4.6 节）<br>4. WG1 的第一个线程（`threadIdx.x == 128`）用 TMA 把 O 写回显存，并等待 TMA 读完 smem<br>5. LSE 直接从寄存器写回显存 | 显存中的 O 和 LSE |
 
 #### Epilogue 的计算在累加器寄存器上完成
 
@@ -182,6 +182,36 @@ warp 0 中的一个线程初始化 `barrier_q`；两个 `PipelineTmaAsync` 对�
 
 **释放越早，下一次加载越早开始。** K(n) 在 GEMM1(n) 完成后立即释放，V(n) 在 GEMM2(n) 完成后释放。槽位释放后，加载方即可向其中写入 K(n+2) 或 V(n+2)。
 
+WG1 和 WG2 各有一份 `smem_pipe_read_k`、`smem_pipe_read_v`，初值都是槽 0，所以两边 `consumer_wait` 等的是同一把 `full`。下图只画 WG1，用来看槽号怎么走；WG2 对同一把 barrier 做同样的等待和释放。流水线 prologue 只推进 K 的槽号，所以进入稳态后，正在读的 K 比 V 超前一块：
+
+```mermaid
+sequenceDiagram
+  participant K0 as K[0]
+  participant K1 as K[1]
+  participant V0 as V[0]
+  participant V1 as V[1]
+  participant WG1
+
+  WG1->>K0: consumer_wait full
+  WG1->>WG1: GEMM1，第 0 块 K
+  WG1->>K0: consumer_release empty，槽号变成 1
+
+  WG1->>K1: consumer_wait full
+  WG1->>WG1: GEMM1，第 1 块 K
+  WG1->>V0: consumer_wait full
+  WG1->>WG1: GEMM2，第 0 块 V
+  WG1->>K1: consumer_release empty
+  WG1->>V0: consumer_release empty
+  Note over WG1: K 槽号回到 0，V 槽号变成 1
+
+  WG1->>K0: consumer_wait full
+  WG1->>WG1: GEMM1，第 2 块 K
+  WG1->>V1: consumer_wait full
+  WG1->>WG1: GEMM2，第 1 块 V
+  WG1->>K0: consumer_release empty
+  WG1->>V1: consumer_release empty
+```
+
 ### 4.5 交接 2：Mainloop → Epilogue（经由寄存器）
 
 Mainloop 结束时，每个计算线程的寄存器中有：
@@ -206,7 +236,7 @@ O 用 TMA 一次写回，TMA 要求数据先在 smem 中排好。本 kernel 不�
 2. 每个线程把自己的 O（已转成 fp16）写入 smem_q。
 3. **`tma_store_fence()`**：普通线程写入 smem 的数据，TMA 硬件不一定立即能看到。这条 fence 保证 TMA 读取时能看到刚才的写入。
 4. **再一次 `NamedBarrier::sync`**：确认 256 个线程都已写完。
-5. 线程 0 发出 TMA 写回（`UTMASTG`），然后用 `tma_store_arrive` / `tma_store_wait<0>` 等待 TMA 读完 smem，之后 CTA 才能退出。
+5. WG1 的第一个线程发出 TMA 写回（`UTMASTG`），然后用 `tma_store_arrive` / `tma_store_wait<0>` 等待 TMA 读完 smem，之后 CTA 才能退出。这不是加载方的线程 0。
 
 超出 seqlen_q 的行不会被 TMA 写回显存。
 
@@ -251,6 +281,53 @@ LSE 每行只有一个 float，数据量很小，不使用 TMA：每行由持有
 
 流水线 prologue 只有 prologue 部分（前面没有块需要做 epilogue 部分），流水线 epilogue 只有 epilogue 部分（后面没有块需要做 prologue 部分）。N 个块共执行 N+1 段，中间的 N-1 次稳态循环有重叠。N = 1 时没有稳态循环，等同于串行。
 
+以三块为例，计算方依次经过流水线 prologue、两次稳态循环、流水线 epilogue（图中的 drain），然后才进入 kernel 级 Epilogue：
+
+```mermaid
+flowchart TB
+  subgraph pro ["prologue"]
+    direction TB
+    p1["等 K0，GEMM1：S0 = Q K0ᵀ"]
+    p2["softmax，P0 写入 tOrP"]
+    p3["O 仍是 0，不做 GEMM2"]
+    p1 --> p2 --> p3
+  end
+
+  subgraph s1 ["稳态 n = 1"]
+    direction TB
+    a1["GEMM1：S1 = Q K1ᵀ"]
+    a2["O 乘以上一块的 α"]
+    a3["GEMM2：O += P0 V0"]
+    a4["softmax 得到 P1，GEMM2 结束后写入 tOrP"]
+    a1 --> a2 --> a3 --> a4
+  end
+
+  subgraph s2 ["稳态 n = 2"]
+    direction TB
+    b1["GEMM1：S2 = Q K2ᵀ"]
+    b2["O 乘以 α1"]
+    b3["GEMM2：O += P1 V1"]
+    b4["softmax 得到 P2，写入 tOrP"]
+    b1 --> b2 --> b3 --> b4
+  end
+
+  subgraph dr ["drain"]
+    direction TB
+    d1["O 乘以 α2"]
+    d2["GEMM2：O += P2 V2，等到做完"]
+    d1 --> d2
+  end
+
+  subgraph epi ["epilogue"]
+    direction TB
+    e1["O 除以整行的和，并算出 LSE"]
+    e2["fp16 写入 smem_q，TMA 写回"]
+    e1 --> e2
+  end
+
+  pro --> s1 --> s2 --> dr --> epi
+```
+
 对应代码（`mma()` 中的 `steady_state_iteration`，省略了 fence）：
 
 ```cpp
@@ -293,6 +370,47 @@ convert_into(tSrS, tOrP);                           // 用 P(n) 覆盖 P(n-1)
           wait<1> → softmax → wait<0>        （此时对方在发出矩阵乘）
 ```
 
+WG2 也做 GEMM1 和 GEMM2。128 行的 Q 被拆成两半：WG1 算行 0–63，WG2 算行 64–127。两边读同一块 K、同一块 V，各自得到自己那 64 行的 S、P 和 O。令牌只决定谁先发指令。
+
+```mermaid
+sequenceDiagram
+  participant K as sK[0]
+  participant V as sV[0]
+  participant B1 as 令牌1
+  participant B2 as 令牌2
+  participant WG1 as WG1 行0到63
+  participant WG2 as WG2 行64到127
+
+  par 同一把 K full[0]
+    WG1->>K: consumer_wait
+    WG2->>K: consumer_wait
+  end
+  WG2->>B1: arrive
+  WG1->>B1: sync，放行
+  WG2->>B2: sync，停住
+  WG1->>WG1: GEMM1，Q的前64行乘K
+  WG1->>B2: arrive
+  B2-->>WG2: 放行
+  WG2->>WG2: GEMM1，Q的后64行乘同一块K
+  WG1->>K: consumer_release
+  WG2->>K: consumer_release
+  WG1->>WG1: softmax，得到自己的P
+  WG2->>WG2: softmax，得到自己的P
+
+  WG1->>B1: sync，放行
+  WG2->>B2: sync，停住
+  WG1->>V: consumer_wait full[0]
+  WG1->>WG1: GEMM2，自己的P乘V，累加前64行O
+  WG1->>B2: arrive
+  B2-->>WG2: 放行
+  WG2->>V: consumer_wait 同一把 full[0]
+  WG2->>WG2: GEMM2，自己的P乘同一块V，累加后64行O
+  WG1->>V: consumer_release
+  WG2->>V: consumer_release
+```
+
+图的上半段是流水线 prologue：两边都做第 0 块的 GEMM1 和 softmax，此时还没有 GEMM2。空行之后是下一轮：WG1 先用第 0 块的 P 和 V 做 GEMM2，再把令牌交给 WG2 做同样的 GEMM2。
+
 每个 warpgroup 恰好轮到 N 次：流水线 prologue 1 次，稳态循环 N-1 次；流水线 epilogue 不参与轮流。WG2 在最后一轮不执行 arrive。否则 TurnWG1 上会多出一次到达，而 WG1 不会再来 sync，CTA 退出时这个 barrier 会停在未完成的状态。
 
 轮流机制只改变两个 warpgroup 发出矩阵乘的先后顺序，与 Prologue/Epilogue 的衔接无关。它的前提是第 5.2 节已经把「发出矩阵乘」和「执行 softmax」分开了。
@@ -305,7 +423,7 @@ convert_into(tSrS, tOrP);                           // 用 P(n) 覆盖 P(n-1)
 
 本 kernel 每个 CTA 只计算一个 tile，计算完就退出；下一个 tile 由另一个 CTA 计算。并且一个 SM 上同一时刻只能运行一个本 kernel 的 CTA：
 
-- 寄存器：每线程 168 个，168 × 384 = 64512，而一个 SM 共有 65536 个，放不下第二个 CTA；
+- 寄存器：按第 3.1 节的分配，24×128 + 240×256 = 168×384 = 64512，而一个 SM 共有 65536 个，放不下第二个 CTA；
 - smem：D=128 时每个 CTA 约 160 KiB，单个 CTA 的上限是 227 KiB。
 
 因此在同一个 SM 上，执行顺序如下：
