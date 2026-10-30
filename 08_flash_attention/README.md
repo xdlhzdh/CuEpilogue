@@ -392,24 +392,30 @@ sequenceDiagram
   WG1->>B2: arrive
   B2-->>WG2: 放行
   WG2->>WG2: GEMM1，Q的后64行乘同一块K
+  WG2->>B1: arrive
   WG1->>K: consumer_release
   WG2->>K: consumer_release
   WG1->>WG1: softmax，得到自己的P
   WG2->>WG2: softmax，得到自己的P
 
+  Note over WG1,WG2: 稳态第 1 轮，同一次令牌
+
   WG1->>B1: sync，放行
   WG2->>B2: sync，停住
+  WG1->>WG1: GEMM1，前64行乘下一块K
   WG1->>V: consumer_wait full[0]
-  WG1->>WG1: GEMM2，自己的P乘V，累加前64行O
+  WG1->>WG1: GEMM2，P0 乘 V，累加前64行O
   WG1->>B2: arrive
   B2-->>WG2: 放行
+  WG2->>WG2: GEMM1，后64行乘同一块K
   WG2->>V: consumer_wait 同一把 full[0]
   WG2->>WG2: GEMM2，自己的P乘同一块V，累加后64行O
+  WG2->>B1: arrive
   WG1->>V: consumer_release
   WG2->>V: consumer_release
 ```
 
-图的上半段是流水线 prologue：两边都做第 0 块的 GEMM1 和 softmax，此时还没有 GEMM2。空行之后是下一轮：WG1 先用第 0 块的 P 和 V 做 GEMM2，再把令牌交给 WG2 做同样的 GEMM2。
+图的上半段是流水线 prologue：两边都做第 0 块的 GEMM1 和 softmax，此时还没有 GEMM2。WG2 发出这次 GEMM1 后 `arrive` 令牌 1，空行之后 WG1 的 `sync` 靠这次到达放行。稳态第 1 轮仍是同一次令牌：先发出下一块的 GEMM1，再发出第 0 块的 GEMM2，然后才把令牌交给对方。WG2 发出自己的 GEMM1 和 GEMM2 后同样 `arrive` 令牌 1。
 
 每个 warpgroup 恰好轮到 N 次：流水线 prologue 1 次，稳态循环 N-1 次；流水线 epilogue 不参与轮流。WG2 在最后一轮不执行 arrive。否则 TurnWG1 上会多出一次到达，而 WG1 不会再来 sync，CTA 退出时这个 barrier 会停在未完成的状态。
 
